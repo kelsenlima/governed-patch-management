@@ -1,0 +1,12 @@
+---
+# Conexão Windows (WinRM 5985 / NTLM).
+# Usuário e senha NÃO ficam no repositório: vêm do variable group "windows-credentials"
+# (DOMAIN_USER / DOMAIN_PASS) por variável de ambiente, para não aparecer na linha de comando.
+ansible_user: "{{ lookup('ansible.builtin.env', 'WINRM_USER') | default('EXAMPLE\\svc_ansible', true) }}"
+ansible_password: "{{ lookup('ansible.builtin.env', 'WINRM_PASSWORD') }}"
+ansible_connection: winrm
+ansible_port: 5985
+ansible_winrm_transport: ntlm
+ansible_winrm_server_cert_validation: ignore
+ansible_winrm_read_timeout_sec: 120
+ansible_winrm_operation_timeout_sec: 100

@@ -1,0 +1,88 @@
+# =============================================================================
+# Política de patch — ansible-patch-qualys
+# -----------------------------------------------------------------------------
+# Decide, para cada pacote vulnerável apontado pelo Qualys, qual ROTA ele segue:
+#
+#   AUTO     → corrigido automaticamente pela esteira
+#   KERNEL   → atualização de kernel (exige reboot para valer)
+#   JANELA   → só corrige em janela de manutenção aprovada
+#   REMOVER  → pacote inseguro que deve ser desinstalado (sempre manual-aprovado)
+#   MANUAL   → a esteira não trata (Windows, sem pacote informado, fora do inventário)
+#
+# Alterações neste arquivo passam por Pull Request.
+# =============================================================================
+
+# Escopo da meta: críticas (5) e altas (4)
+severidades: "4-5"
+
+# Tags do Qualys que definem os servidores no escopo
+tags_qualys:
+  - DEB-PROD
+  - DEB-NPROD
+  - RHEL-PROD
+
+# Windows Server: entram na coleta e no PLANO, classificados por tipo de correção
+# (KB do Windows, produto Microsoft, terceiros, configuração). A aplicação é do W2/W2b
+# (roles/patch_windows).
+tags_qualys_windows:
+  - SRV-PROD-WIN
+  - SRV-NPROD-WIN
+
+# Servidores que aparecem no Qualys fora do inventário e JÁ têm explicação (não são da esteira).
+# Continuam no plano, numa lista separada com o motivo, para não parecerem pendência.
+# "host" casa com o nome do Qualys (DNS curto/NetBIOS) ou com o IP.
+fora_inventario_conhecidos:
+  - host: 10.20.9.124
+    motivo: exemplo — servidor desativado, aguardando remoção do ativo no Qualys
+  - host: agent-01
+    motivo: agente self-hosted das pipelines — patch manual (atualizar o agente no meio do job derruba a execução)
+
+# Categorias do Qualys fora do escopo de infraestrutura
+# (SCA = bibliotecas de aplicação: Go, pip, npm, composer → time de Dev)
+categorias_excluidas:
+  - SCA
+
+# Kernel: exige reboot. Inclui pacotes-fonte que o Qualys reporta (ex.: "linux").
+pacotes_kernel:
+  - linux
+  - linux-*
+  - kernel
+  - kernel-*
+
+# Pacotes sensíveis: atualizar sem validação pode derrubar a aplicação
+pacotes_protegidos:
+  - nginx*
+  - apache2*
+  - httpd*
+  - php*
+  - mysql*
+  - mariadb*
+  - postgresql*
+  - redis*
+  - memcached*
+  - openjdk*
+  - java*
+  - docker*
+  - containerd*
+  - libssl*         # openssl: muitas apps linkam; exige restart de serviços
+  - openssl*
+  - systemd*
+  - grub*
+
+# Pacotes inseguros que devem ser removidos (nunca automático: vai para aprovação)
+pacotes_remover:
+  - telnet
+  - telnetd
+  - rsh-client
+  - rsh-server
+  - vsftpd
+  - netcat-traditional
+
+# Como cada ambiente trata as rotas
+ambientes:
+  nao_producao:
+    protegidos: AUTO        # homologação valida o patch antes de produção
+    kernel: KERNEL          # atualiza e reinicia
+  producao:
+    protegidos: JANELA
+    kernel: JANELA          # kernel em produção só com janela (reboot)

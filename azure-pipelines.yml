@@ -1,0 +1,431 @@
+# =============================================================================
+# ansible-patch-qualys — Patch Linux guiado pelo Qualys
+# -----------------------------------------------------------------------------
+# Fase 1 (padrão): Plano          → coleta no Qualys + plano por servidor. NÃO altera nada.
+# Fase 2 (opcional): Patch        → só roda com "Executar patch" marcado.
+#    - "🧪 Simular" (padrão LIGADO): ansible --check --diff, não altera nada;
+#      para aplicar de verdade é preciso desmarcar de forma explícita.
+#    - Não-produção: aplica AUTO + kernel com reboot (environment patch-nao-producao)
+#    - Produção:     aplica AUTO; JANELA/kernel/reboot só com "Janela de manutenção"
+#                    (environment patch-producao, com aprovação obrigatória)
+# Pré-requisitos no Azure DevOps: ver README → "Pré-requisitos".
+# =============================================================================
+
+name: 'patch-qualys-$(Date:yyyyMMdd)$(Rev:.r)'
+
+trigger: none
+pr: none
+
+schedules:
+  # Plano semanal: segunda 10:00 (Brasília) = 13:00 UTC. Só gera o plano.
+  - cron: '0 13 * * 1'
+    displayName: 'Plano semanal (somente leitura)'
+    branches:
+      include: [main]
+    always: true
+
+parameters:
+  - name: descobrir_servicos
+    displayName: '🔍 Descobrir serviços e URLs de saúde (somente leitura; gera sugestão de host_vars)'
+    type: boolean
+    default: false
+  - name: sistemas_descoberta
+    displayName: '🖥️ Descoberta em quais sistemas'
+    type: string
+    default: linux
+    values: [linux, windows, ambos]
+  - name: executar_patch
+    displayName: '⚙️ Executar patch (Fase 2)? Desmarcado = só gera o plano'
+    type: boolean
+    default: false
+  - name: simular
+    displayName: '🧪 Simular (--check: mostra o que mudaria, NÃO instala nem reinicia)'
+    type: boolean
+    default: true
+  - name: sistemas_patch
+    displayName: '💻 Patch em quais sistemas (windows = W2, Windows Update)'
+    type: string
+    default: linux
+    values: [linux, windows, ambos]
+  - name: ambiente
+    displayName: '🎯 Ambiente do patch'
+    type: string
+    default: nao_producao
+    values: [nao_producao, producao, ambos]
+  - name: janela_manutencao
+    displayName: '🪟 Janela de manutenção em produção (libera protegidos, kernel e reboot)'
+    type: boolean
+    default: false
+  - name: remover_inseguros
+    displayName: '🗑️ Remover pacotes inseguros (telnet, vsftpd...)'
+    type: boolean
+    default: false
+  - name: limitar_hosts
+    displayName: '🔎 Limitar a hosts (padrão Ansible --limit; "all" = todos do ambiente)'
+    type: string
+    default: all
+
+variables:
+  - group: qualys-api            # QUALYS_USER, QUALYS_PASS (secret); PATCH_CHAT_WEBHOOK (secret, opcional: aviso no Google Chat)
+  - name: QUALYS_API_URL
+    value: https://qualysapi.qg2.apps.qualys.com   # ajuste para a URL de API da SUA plataforma Qualys
+  - name: ANSIBLE_CONFIG
+    value: $(Build.SourcesDirectory)/ansible.cfg
+
+pool:
+  name: 'self-hosted-ansible'
+
+stages:
+  # ---------------------------------------------------------------------------
+  - stage: Plano
+    displayName: '1 · Coleta Qualys + Plano (somente leitura)'
+    jobs:
+      - job: Plano
+        displayName: 'Gerar plano'
+        timeoutInMinutes: 20
+        steps:
+          - checkout: self
+            clean: true
+
+          - script: |
+              set -euo pipefail
+              python3 -m venv .venv
+              . .venv/bin/activate
+              pip install -q --upgrade pip
+              pip install -q -r requirements.txt
+              python --version && ansible --version | head -1
+            displayName: 'Preparar Python/Ansible (venv)'
+
+          - script: |
+              . .venv/bin/activate
+              python -m unittest discover -s tests -v
+            displayName: 'Testes (parser e política)'
+
+          - script: |
+              set -euo pipefail
+              . .venv/bin/activate
+              python scripts/qualys_coleta.py --policy policy/policy.yml --saida out/deteccoes.json
+            displayName: 'Coletar detecções no Qualys'
+            env:
+              QUALYS_USER: $(QUALYS_USER)
+              QUALYS_PASS: $(QUALYS_PASS)
+
+          - script: |
+              set -euo pipefail
+              . .venv/bin/activate
+              python scripts/gerar_plano.py --entrada out/deteccoes.json --policy policy/policy.yml \
+                --inventario inventories/hosts.yml --saida out
+              echo "##vso[task.uploadsummary]$(Build.SourcesDirectory)/out/resumo.md"
+            displayName: 'Gerar plano por servidor'
+
+          - publish: out
+            artifact: plano
+            displayName: 'Publicar plano (plano.json, plano.csv, resumo.md)'
+
+  # ---------------------------------------------------------------------------
+  - stage: Descoberta
+    displayName: '0 · Descobrir serviços (somente leitura)'
+    dependsOn: []
+    condition: eq('${{ parameters.descobrir_servicos }}', 'true')
+    jobs:
+      - job: Descobrir
+        displayName: 'Linux — serviços e URLs de saúde'
+        condition: in('${{ parameters.sistemas_descoberta }}', 'linux', 'ambos')
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+            clean: true
+          - task: DownloadSecureFile@1
+            name: sshKey
+            inputs:
+              secureFile: 'ssh_key_ansible'
+          - script: |
+              set -euo pipefail
+              python3 -m venv .venv && . .venv/bin/activate
+              pip install -q -r requirements.txt
+              KEY="$(Agent.TempDirectory)/patch_key"
+              tr -d '\r' < "$(sshKey.secureFilePath)" > "$KEY" && chmod 600 "$KEY"
+              case '${{ parameters.ambiente }}' in ambos) ALVO=all ;; *) ALVO='${{ parameters.ambiente }}' ;; esac
+              RC=0
+              ansible-playbook playbooks/descobrir_servicos.yml -e alvo="$ALVO" \
+                --limit '${{ parameters.limitar_hosts }}' --private-key "$KEY" || RC=$?
+              rm -f "$KEY"
+              [ -f out/descoberta.md ] && echo "##vso[task.uploadsummary]$(Build.SourcesDirectory)/out/descoberta.md"
+              exit $RC
+            displayName: 'ansible-playbook descobrir_servicos'
+          - publish: out/descoberta
+            artifact: descoberta
+            condition: always()
+
+      - job: DescobrirWindows
+        displayName: 'Windows — serviços, IIS e URLs de saúde'
+        condition: in('${{ parameters.sistemas_descoberta }}', 'windows', 'ambos')
+        timeoutInMinutes: 30
+        variables:
+          - group: windows-credentials     # DOMAIN_USER / DOMAIN_PASS (conta de serviço do domínio com admin local)
+        steps:
+          - checkout: self
+            clean: true
+          - script: |
+              set -euo pipefail
+              python3 -m venv .venv && . .venv/bin/activate
+              pip install -q -r requirements.txt
+              export ANSIBLE_COLLECTIONS_PATH="$PWD/collections"
+              ansible-galaxy collection install -r requirements.yml -p ./collections >/dev/null
+              case '${{ parameters.ambiente }}' in ambos) ALVO=windows ;; *) ALVO='${{ parameters.ambiente }}' ;; esac
+              RC=0
+              ansible-playbook -i inventories/windows.yml playbooks/descobrir_servicos_windows.yml \
+                -e alvo="$ALVO" --limit '${{ parameters.limitar_hosts }}' || RC=$?
+              [ -f out/descoberta-windows.md ] && echo "##vso[task.uploadsummary]$(Build.SourcesDirectory)/out/descoberta-windows.md"
+              exit $RC
+            displayName: 'ansible-playbook descobrir_servicos_windows'
+            env:
+              WINRM_USER: $(DOMAIN_USER)          # lidas pelo group_vars via lookup('env');
+              WINRM_PASSWORD: $(DOMAIN_PASS)      # não vão na linha de comando
+          - publish: out/descoberta-windows
+            artifact: descoberta-windows
+            condition: always()
+
+  # ---------------------------------------------------------------------------
+  - stage: Patch_NaoProducao
+    displayName: '2 · Patch não-produção'
+    dependsOn: Plano
+    condition: >-
+      and(succeeded(),
+          eq('${{ parameters.executar_patch }}', 'true'),
+          in('${{ parameters.ambiente }}', 'nao_producao', 'ambos'))
+    jobs:
+      - deployment: Aplicar
+        displayName: 'Aplicar plano — não-produção'
+        condition: in('${{ parameters.sistemas_patch }}', 'linux', 'ambos')
+        environment: patch-nao-producao
+        timeoutInMinutes: 120
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+                - download: current
+                  artifact: plano
+                - task: DownloadSecureFile@1
+                  name: sshKey
+                  inputs:
+                    secureFile: 'ssh_key_ansible'
+                - script: |
+                    set -euo pipefail
+                    python3 -m venv .venv && . .venv/bin/activate
+                    pip install -q -r requirements.txt
+                    mkdir -p out && cp "$(Pipeline.Workspace)/plano/plano.json" out/plano.json
+                    KEY="$(Agent.TempDirectory)/patch_key"
+                    tr -d '\r' < "$(sshKey.secureFilePath)" > "$KEY" && chmod 600 "$KEY"
+                    MODO=""
+                    if [ "$(echo "$SIMULAR" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+                      MODO="--check --diff -e max_falhas=100"
+                      echo "##[warning]MODO SIMULAÇÃO: nada será instalado nem reiniciado."
+                    else
+                      echo "##[warning]MODO REAL: pacotes serão atualizados e servidores podem reiniciar."
+                    fi
+                    ansible-playbook playbooks/aplicar_linux.yml $MODO \
+                      -e alvo=nao_producao -e lote=5 \
+                      -e patch_aplicar_kernel=true -e patch_permitir_reboot=true \
+                      -e patch_aplicar_remover=${{ parameters.remover_inseguros }} \
+                      --limit '${{ parameters.limitar_hosts }}' \
+                      --private-key "$KEY"
+                  displayName: 'ansible-playbook (não-produção)'
+                  env:
+                    SIMULAR: ${{ parameters.simular }}
+                - script: |
+                    . .venv/bin/activate
+                    rm -f "$(Agent.TempDirectory)/patch_key"
+                    RC=0; python scripts/resumo_resultado.py out/resultado || RC=$?
+                    echo "##vso[task.uploadsummary]$(Build.SourcesDirectory)/out/resultado.md"
+                    exit $RC
+                  displayName: 'Resumo do resultado'
+                  condition: always()
+                - publish: out/resultado
+                  artifact: resultado-nao-producao
+                  condition: always()
+                - script: python3 scripts/notificar_chat.py out/resultado "não-produção · Linux"
+                  displayName: 'Avisar no Google Chat'
+                  condition: always()
+                  env:
+                    PATCH_CHAT_WEBHOOK: $(PATCH_CHAT_WEBHOOK)   # secreta, grupo qualys-api (sem ela, não envia)
+
+      - deployment: AplicarWindows
+        displayName: 'Windows (W2) — não-produção'
+        environment: patch-nao-producao
+        condition: in('${{ parameters.sistemas_patch }}', 'windows', 'ambos')
+        timeoutInMinutes: 240
+        variables:
+          - group: windows-credentials     # DOMAIN_USER / DOMAIN_PASS (conta de serviço do domínio com admin local)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+                - download: current
+                  artifact: plano
+                - script: |
+                    set -euo pipefail
+                    python3 -m venv .venv && . .venv/bin/activate
+                    pip install -q -r requirements.txt
+                    export ANSIBLE_COLLECTIONS_PATH="$PWD/collections"
+                    ansible-galaxy collection install -r requirements.yml -p ./collections >/dev/null
+                    mkdir -p out && cp "$(Pipeline.Workspace)/plano/plano.json" out/plano.json
+                    MODO=""
+                    if [ "$(echo "$SIMULAR" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+                      MODO="--check --diff -e max_falhas=100"
+                      echo "##[warning]MODO SIMULAÇÃO (Windows): nada será instalado nem reiniciado."
+                    else
+                      echo "##[warning]MODO REAL (Windows): atualizações serão instaladas e servidores podem reiniciar."
+                    fi
+                    ansible-playbook -i inventories/windows.yml playbooks/aplicar_windows.yml $MODO \
+                      -e alvo=nao_producao -e lote=5 \
+                      -e patch_win_instalar=true \
+                      -e patch_win_permitir_reboot=true \
+                      --limit '${{ parameters.limitar_hosts }}'
+                  displayName: 'ansible-playbook Windows (não-produção)'
+                  env:
+                    SIMULAR: ${{ parameters.simular }}
+                    WINRM_USER: $(DOMAIN_USER)
+                    WINRM_PASSWORD: $(DOMAIN_PASS)
+                - script: |
+                    . .venv/bin/activate
+                    RC=0; python scripts/resumo_resultado.py out/resultado-windows out/resultado-windows.md || RC=$?
+                    [ -f out/resultado-windows.md ] && echo "##vso[task.uploadsummary]$(Build.SourcesDirectory)/out/resultado-windows.md"
+                    exit $RC
+                  displayName: 'Resumo do resultado (Windows)'
+                  condition: always()
+                - publish: out/resultado-windows
+                  artifact: resultado-windows-nao-producao
+                  condition: always()
+                - script: python3 scripts/notificar_chat.py out/resultado-windows "não-produção · Windows"
+                  displayName: 'Avisar no Google Chat'
+                  condition: always()
+                  env:
+                    PATCH_CHAT_WEBHOOK: $(PATCH_CHAT_WEBHOOK)   # secreta, grupo qualys-api (sem ela, não envia)
+
+  # ---------------------------------------------------------------------------
+  - stage: Patch_Producao
+    displayName: '3 · Patch produção'
+    dependsOn: [Plano, Patch_NaoProducao]
+    condition: >-
+      and(not(failed()), not(canceled()),
+          eq('${{ parameters.executar_patch }}', 'true'),
+          in('${{ parameters.ambiente }}', 'producao', 'ambos'),
+          in(dependencies.Patch_NaoProducao.result, 'Succeeded', 'Skipped'))
+    jobs:
+      - deployment: Aplicar
+        displayName: 'Aplicar plano — produção (1 host por vez)'
+        condition: in('${{ parameters.sistemas_patch }}', 'linux', 'ambos')
+        environment: patch-producao   # configurar Approvals no Azure DevOps
+        timeoutInMinutes: 180
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+                - download: current
+                  artifact: plano
+                - task: DownloadSecureFile@1
+                  name: sshKey
+                  inputs:
+                    secureFile: 'ssh_key_ansible'
+                - script: |
+                    set -euo pipefail
+                    python3 -m venv .venv && . .venv/bin/activate
+                    pip install -q -r requirements.txt
+                    mkdir -p out && cp "$(Pipeline.Workspace)/plano/plano.json" out/plano.json
+                    KEY="$(Agent.TempDirectory)/patch_key"
+                    tr -d '\r' < "$(sshKey.secureFilePath)" > "$KEY" && chmod 600 "$KEY"
+                    MODO=""
+                    if [ "$(echo "$SIMULAR" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+                      MODO="--check --diff -e max_falhas=100"
+                      echo "##[warning]MODO SIMULAÇÃO: nada será instalado nem reiniciado."
+                    else
+                      echo "##[warning]MODO REAL: pacotes serão atualizados e servidores podem reiniciar."
+                    fi
+                    ansible-playbook playbooks/aplicar_linux.yml $MODO \
+                      -e alvo=producao -e lote=1 \
+                      -e patch_aplicar_janela=${{ parameters.janela_manutencao }} \
+                      -e patch_permitir_reboot=${{ parameters.janela_manutencao }} \
+                      -e patch_aplicar_remover=${{ parameters.remover_inseguros }} \
+                      --limit '${{ parameters.limitar_hosts }}' \
+                      --private-key "$KEY"
+                  displayName: 'ansible-playbook (produção)'
+                  env:
+                    SIMULAR: ${{ parameters.simular }}
+                - script: |
+                    . .venv/bin/activate
+                    rm -f "$(Agent.TempDirectory)/patch_key"
+                    RC=0; python scripts/resumo_resultado.py out/resultado || RC=$?
+                    echo "##vso[task.uploadsummary]$(Build.SourcesDirectory)/out/resultado.md"
+                    exit $RC
+                  displayName: 'Resumo do resultado'
+                  condition: always()
+                - publish: out/resultado
+                  artifact: resultado-producao
+                  condition: always()
+                - script: python3 scripts/notificar_chat.py out/resultado "produção · Linux"
+                  displayName: 'Avisar no Google Chat'
+                  condition: always()
+                  env:
+                    PATCH_CHAT_WEBHOOK: $(PATCH_CHAT_WEBHOOK)   # secreta, grupo qualys-api (sem ela, não envia)
+
+      - deployment: AplicarWindows
+        displayName: 'Windows (W2) — produção, 1 por vez'
+        environment: patch-producao
+        condition: in('${{ parameters.sistemas_patch }}', 'windows', 'ambos')
+        timeoutInMinutes: 300
+        variables:
+          - group: windows-credentials     # DOMAIN_USER / DOMAIN_PASS (conta de serviço do domínio com admin local)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+                - download: current
+                  artifact: plano
+                - script: |
+                    set -euo pipefail
+                    python3 -m venv .venv && . .venv/bin/activate
+                    pip install -q -r requirements.txt
+                    export ANSIBLE_COLLECTIONS_PATH="$PWD/collections"
+                    ansible-galaxy collection install -r requirements.yml -p ./collections >/dev/null
+                    mkdir -p out && cp "$(Pipeline.Workspace)/plano/plano.json" out/plano.json
+                    MODO=""
+                    if [ "$(echo "$SIMULAR" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+                      MODO="--check --diff -e max_falhas=100"
+                      echo "##[warning]MODO SIMULAÇÃO (Windows): nada será instalado nem reiniciado."
+                    else
+                      echo "##[warning]MODO REAL (Windows): atualizações serão instaladas e servidores podem reiniciar."
+                    fi
+                    ansible-playbook -i inventories/windows.yml playbooks/aplicar_windows.yml $MODO \
+                      -e alvo=producao -e lote=1 \
+                      -e patch_win_instalar=${{ parameters.janela_manutencao }} \
+                      -e patch_win_permitir_reboot=${{ parameters.janela_manutencao }} \
+                      --limit '${{ parameters.limitar_hosts }}'
+                  displayName: 'ansible-playbook Windows (produção, 1 por vez)'
+                  env:
+                    SIMULAR: ${{ parameters.simular }}
+                    WINRM_USER: $(DOMAIN_USER)
+                    WINRM_PASSWORD: $(DOMAIN_PASS)
+                - script: |
+                    . .venv/bin/activate
+                    RC=0; python scripts/resumo_resultado.py out/resultado-windows out/resultado-windows.md || RC=$?
+                    [ -f out/resultado-windows.md ] && echo "##vso[task.uploadsummary]$(Build.SourcesDirectory)/out/resultado-windows.md"
+                    exit $RC
+                  displayName: 'Resumo do resultado (Windows)'
+                  condition: always()
+                - publish: out/resultado-windows
+                  artifact: resultado-windows-producao
+                  condition: always()
+                - script: python3 scripts/notificar_chat.py out/resultado-windows "produção · Windows"
+                  displayName: 'Avisar no Google Chat'
+                  condition: always()
+                  env:
+                    PATCH_CHAT_WEBHOOK: $(PATCH_CHAT_WEBHOOK)   # secreta, grupo qualys-api (sem ela, não envia)

@@ -1,0 +1,30 @@
+# =============================================================================
+# Inventário de EXEMPLO — Windows Server da esteira (troque pelos seus)
+# Conexão em group_vars/windows.yml (WinRM 5985 / NTLM; credencial por variável de ambiente).
+# Usado pela descoberta de serviços (somente leitura) e pelo patch W2/W2b.
+# =============================================================================
+all:
+  children:
+    windows:
+      children:
+        nao_producao:
+          hosts:
+            win-web-hml-01:
+              ansible_host: win-web-hml-01.corp.example.local
+        producao:
+          hosts:
+            win-app-prd-01:
+              ansible_host: win-app-prd-01.corp.example.local
+            win-web-prd-01:                 # IIS com muitos sites
+              ansible_host: win-web-prd-01.corp.example.local
+            WIN-RPA-PRD-01:                 # nome em maiúsculas também funciona (o Qualys casa sem diferenciar)
+              ansible_host: WIN-RPA-PRD-01.corp.example.local
+            # Controladores de domínio: também em "controladores_dominio" (produção roda 1 por vez)
+            win-dc-01:
+              ansible_host: win-dc-01.corp.example.local
+            win-dc-02:
+              ansible_host: win-dc-02.corp.example.local
+    controladores_dominio:
+      hosts:
+        win-dc-01:
+        win-dc-02:

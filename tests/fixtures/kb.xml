@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<KNOWLEDGE_BASE_VULN_LIST_OUTPUT><RESPONSE><VULN_LIST>
+<VULN><QID>6877835</QID><VULN_TYPE>Vulnerability</VULN_TYPE><SEVERITY_LEVEL>5</SEVERITY_LEVEL><TITLE><![CDATA[Ubuntu Security Notification for Linux kernel (USN-9024-1)]]></TITLE><CATEGORY>Ubuntu</CATEGORY></VULN>
+<VULN><QID>6800001</QID><TITLE><![CDATA[Ubuntu libxml2]]></TITLE><CATEGORY>Ubuntu</CATEGORY></VULN>
+<VULN><QID>6800002</QID><TITLE><![CDATA[Ubuntu nginx]]></TITLE><CATEGORY>Ubuntu</CATEGORY></VULN>
+<VULN><QID>5001508</QID><TITLE><![CDATA[PHP (Composer) laravel]]></TITLE><CATEGORY>SCA</CATEGORY></VULN>
+<VULN><QID>38001</QID><TITLE><![CDATA[Telnet instalado]]></TITLE><CATEGORY>General remote services</CATEGORY></VULN>
+<VULN><QID>354001</QID><TITLE><![CDATA[Rocky openssl/sudo]]></TITLE><CATEGORY>Rocky Linux</CATEGORY></VULN>
+<VULN><QID>92378</QID><TITLE><![CDATA[Microsoft .NET]]></TITLE><CATEGORY>Windows</CATEGORY></VULN>
+<VULN><QID>178001</QID><TITLE><![CDATA[Debian bind9]]></TITLE><CATEGORY>Debian</CATEGORY></VULN>
+<VULN><QID>91001</QID><TITLE><![CDATA[Microsoft Windows Security Update for November 2026]]></TITLE><CATEGORY>Windows</CATEGORY></VULN>
+<VULN><QID>370001</QID><TITLE><![CDATA[Google Chrome Prior to 131.0 Multiple Vulnerabilities]]></TITLE><CATEGORY>Local</CATEGORY></VULN>
+<VULN><QID>38170</QID><TITLE><![CDATA[SSL Certificate - Self-Signed Certificate]]></TITLE><CATEGORY>General remote services</CATEGORY></VULN>
+<VULN><QID>110450</QID><TITLE><![CDATA[Microsoft Office Security Update for November 2026]]></TITLE><CATEGORY>Office Application</CATEGORY></VULN>
+</VULN_LIST></RESPONSE></KNOWLEDGE_BASE_VULN_LIST_OUTPUT>

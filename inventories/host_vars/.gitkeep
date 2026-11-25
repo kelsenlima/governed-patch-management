@@ -1,0 +1,2 @@
+# host_vars/<servidor>.yml — health check da aplicação por servidor.
+# Gerar a sugestão com o modo "🔍 Descobrir serviços" da pipeline e revisar com o responsável.

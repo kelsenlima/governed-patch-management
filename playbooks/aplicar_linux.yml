@@ -1,0 +1,26 @@
+---
+# =============================================================================
+# Fase 2 — Aplicação do plano (desligada por padrão na pipeline).
+#
+# Exemplo (não-produção, com kernel e reboot):
+#   ansible-playbook playbooks/aplicar_linux.yml \
+#     -e alvo=nao_producao -e plano_arquivo=out/plano.json \
+#     -e patch_aplicar_kernel=true -e patch_permitir_reboot=true
+#
+# Produção (somente AUTO, um host por vez):
+#   ansible-playbook playbooks/aplicar_linux.yml -e alvo=producao -e lote=1
+# =============================================================================
+- name: Patch Linux guiado pelo Qualys
+  hosts: "{{ alvo | default('nao_producao') }}"
+  become: true
+  gather_facts: true
+  serial: "{{ lote | default(1) }}"
+  # Patch real: falhou um host, o lote para. Simulação (-e max_falhas=100): segue nos demais
+  # para o relatório cobrir todos os servidores.
+  max_fail_percentage: "{{ max_falhas | default(0) }}"
+  vars:
+    plano_arquivo: "{{ playbook_dir }}/../out/plano.json"
+    plano: "{{ lookup('ansible.builtin.file', plano_arquivo) | from_json }}"
+
+  roles:
+    - patch_linux

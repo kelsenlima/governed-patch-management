@@ -1,0 +1,12 @@
+---
+# win-web-prd-01 — produção · IIS (EXEMPLO). Sugerido pelo modo 🔍 (descoberta Windows) e revisado.
+servicos_criticos:
+  - W3SVC
+  - WAS
+
+# Sites IIS testados pelo próprio binding (IP + porta + cabeçalho Host):
+# o IIS responde 400 em 127.0.0.1 quando o site é amarrado a host/IP.
+health_iis:
+  - site: portal
+    url: http://10.20.5.10:80/
+    host: portal.example.com

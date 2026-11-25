@@ -1,0 +1,161 @@
+---
+# W2b — atualiza UM produto presente no servidor (chamado em loop pelo main.yml).
+# item: entrada de patch_win_terceiros_catalogo (+ "deteccoes")
+#   tipo pacote (padrão): baixa o instalador oficial, instala a versão de máquina e remove as
+#                         cópias por usuário desatualizadas (quando há caminho_perfil);
+#   tipo office_c2r     : dispara a atualização do Office ClickToRun pelo canal do próprio Office.
+
+# =============================================================== tipo pacote
+- name: "W2b — {{ item.nome }}: instalador oficial do fornecedor"
+  when: (item.tipo | default('pacote')) == 'pacote'
+  block:
+    # Link com a versão no nome (ex.: 7-Zip): lê a página oficial de download no próprio servidor
+    - name: "W2b — localizar a versão mais nova de {{ item.nome }} na página do fornecedor"
+      ansible.windows.win_uri:
+        url: "{{ item.url_pagina }}"
+        return_content: true
+        timeout: 60
+      register: _terc_pagina
+      failed_when: false
+      when: item.url_pagina is defined
+
+    - name: "W2b — URL do instalador de {{ item.nome }}"
+      ansible.builtin.set_fact:
+        _terc_url: >-
+          {{ (item.url_base ~ ((_terc_pagina.content | default('')) | regex_search(item.url_regex)))
+             if (item.url_pagina is defined and ((_terc_pagina.content | default('')) | regex_search(item.url_regex)))
+             else ('' if item.url_pagina is defined else item.url) }}
+
+    - name: "W2b — baixar {{ item.nome }}"
+      ansible.windows.win_get_url:
+        url: "{{ _terc_url }}"
+        dest: "C:\\Windows\\Temp\\ansible-patch-qualys-{{ item.arquivo }}"
+        force: true
+      register: _terc_download
+      failed_when: false
+      when: _terc_url | length > 0
+
+    - name: "W2b — instalar {{ item.nome }}"
+      ansible.windows.win_package:
+        path: "C:\\Windows\\Temp\\ansible-patch-qualys-{{ item.arquivo }}"
+        arguments: "{{ item.argumentos }}"
+        state: present
+        expected_return_code: [0, 3010]
+      register: _terc_inst
+      failed_when: false
+      when:
+        - _terc_url | length > 0
+        - not (_terc_download.failed | default(false))
+        - (_terc_download.status_code | default(200)) == 200
+
+    # Cópias POR USUÁRIO (C:\Users\<u>\AppData\Local\...): depois que a versão de máquina está instalada, apaga só a
+    # pasta do programa no perfil (a pasta de dados — favoritos, perfil — fica e é usada pela versão de máquina).
+    # Perfil com o programa aberto é pulado e aparece no resultado.
+    - name: "W2b — remover cópias por usuário desatualizadas de {{ item.nome }}"
+      ansible.windows.win_powershell:
+        parameters:
+          CaminhoPerfil: "{{ item.caminho_perfil }}"
+        script: |
+          [CmdletBinding()]
+          param([string]$CaminhoPerfil)
+          $removidos = @(); $emUso = @(); $falhas = @()
+          foreach ($u in (Get-ChildItem -Path "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue)) {
+              $exe = Join-Path $u.FullName $CaminhoPerfil
+              if (-not (Test-Path -LiteralPath $exe)) { continue }
+              $pasta = Split-Path -Parent $exe
+              $rodando = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($pasta, [StringComparison]::OrdinalIgnoreCase) })
+              if ($rodando.Count -gt 0) { $emUso += $u.Name; continue }
+              try { Remove-Item -LiteralPath $pasta -Recurse -Force -ErrorAction Stop; $removidos += $u.Name }
+              catch { $falhas += ('{0}: {1}' -f $u.Name, $_.Exception.Message) }
+          }
+          $Ansible.Changed = ($removidos.Count -gt 0)
+          $Ansible.Result = @{ removidos = $removidos; em_uso = $emUso; falhas = $falhas }
+      register: _terc_perfis
+      failed_when: false
+      when:
+        - item.caminho_perfil is defined
+        - _terc_inst is not skipped
+        - not (_terc_inst.failed | default(false))
+        - (_terc_inst.rc | default(0)) in [0, 3010]
+
+    - name: "W2b — remover o instalador baixado de {{ item.nome }}"
+      ansible.windows.win_file:
+        path: "C:\\Windows\\Temp\\ansible-patch-qualys-{{ item.arquivo }}"
+        state: absent
+      failed_when: false
+
+    - name: "W2b — registrar {{ item.nome }}"
+      ansible.builtin.set_fact:
+        _terc_exec: >-
+          {{ _terc_exec | default({}) | combine({item.nome: {
+               'download': ('falhou: link da versão nova não encontrado em ' ~ (item.url_pagina | default('')))
+                           if (_terc_url | length == 0) else
+                           (('falhou: ' ~ (_terc_download.msg | default('') | truncate(160)))
+                            if (_terc_download.failed | default(false)) else 'ok'),
+               'instalacao': ('não executada' if _terc_inst is skipped else
+                             (('falhou: ' ~ (_terc_inst.msg | default('') | truncate(160)) ~ ' rc=' ~ (_terc_inst.rc | default('')))
+                              if (_terc_inst.failed | default(false)) or ((_terc_inst.rc | default(0)) not in [0, 3010])
+                              else 'ok')),
+               'reboot_pedido': (_terc_inst.reboot_required | default(false)),
+               'origem': _terc_url,
+               'perfis_removidos': (_terc_perfis.result | default({})).removidos | default([]),
+               'perfis_em_uso': (_terc_perfis.result | default({})).em_uso | default([]),
+               'perfis_falhas': (_terc_perfis.result | default({})).falhas | default([])
+             }}) }}
+
+# =============================================================== tipo office_c2r
+# Comando padrão de atualização do ClickToRun (OfficeC2RClient /update user ... forceappshutdown=true).
+# O cliente dispara a atualização e o serviço ClickToRun baixa e aplica em segundo plano: a tarefa
+# acompanha até a versão mudar ou o cliente terminar (limite: timeout_min). Não reinicia o servidor.
+- name: "W2b — {{ item.nome }}: atualizar pelo canal do Office"
+  when: (item.tipo | default('pacote')) == 'office_c2r'
+  block:
+    - name: "W2b — atualizar {{ item.nome }}"
+      ansible.windows.win_powershell:
+        parameters:
+          TimeoutMin: "{{ item.timeout_min | default(45) | int }}"
+        script: |
+          [CmdletBinding()]
+          param([int]$TimeoutMin = 45)
+          $cli = Join-Path $env:CommonProgramFiles 'microsoft shared\ClickToRun\OfficeC2RClient.exe'
+          $chave = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+          $ver = { [string](Get-ItemProperty $chave -ErrorAction SilentlyContinue).VersionToReport }
+          $antes = & $ver
+          if (-not (Test-Path -LiteralPath $cli)) {
+              $Ansible.Failed = $true
+              $Ansible.Result = @{ antes = $antes; depois = $antes; situacao = 'OfficeC2RClient.exe não encontrado' }
+              return
+          }
+          Start-Process -FilePath $cli -ArgumentList '/update user displaylevel=false forceappshutdown=true' -Wait
+          $limite = (Get-Date).AddMinutes($TimeoutMin)
+          Start-Sleep -Seconds 60
+          do {
+              $depois = & $ver
+              $rodando = @(Get-Process -Name OfficeC2RClient -ErrorAction SilentlyContinue).Count -gt 0
+              if ($depois -ne $antes -or -not $rodando) { break }
+              Start-Sleep -Seconds 30
+          } while ((Get-Date) -lt $limite)
+          $depois = & $ver
+          $situacao = if ($depois -ne $antes) { 'atualizado' }
+                      elseif ($rodando) { "ainda em andamento após $TimeoutMin min (conclui em segundo plano)" }
+                      else { 'sem atualização nova no canal configurado' }
+          $Ansible.Changed = ($depois -ne $antes)
+          $Ansible.Result = @{ antes = $antes; depois = $depois; situacao = $situacao }
+      register: _terc_office
+      failed_when: false
+
+    - name: "W2b — registrar {{ item.nome }}"
+      ansible.builtin.set_fact:
+        _terc_exec: >-
+          {{ _terc_exec | default({}) | combine({item.nome: {
+               'download': 'ok',
+               'instalacao': ('ok' if (_terc_office.result | default({})).situacao | default('') == 'atualizado'
+                              else ('falhou: ' ~ ((_terc_office.result | default({})).situacao
+                                                  | default(_terc_office.msg | default('erro desconhecido')) | truncate(160)))),
+               'reboot_pedido': false,
+               'origem': 'canal do Office (ClickToRun)',
+               'situacao': (_terc_office.result | default({})).situacao | default(''),
+               'perfis_removidos': [],
+               'perfis_em_uso': [],
+               'perfis_falhas': []
+             }}) }}

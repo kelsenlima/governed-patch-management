@@ -1,0 +1,9 @@
+---
+# web-prd-01 — produção · web (EXEMPLO). Gerado pelo modo 🔍 Descobrir serviços e revisado.
+# Agentes (segurança, backup, monitoração, nuvem) ficam de fora de propósito.
+servicos_criticos:
+  - nginx
+  - php8.2-fpm
+
+health_urls:
+  - http://127.0.0.1:80/

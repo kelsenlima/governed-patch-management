@@ -1,0 +1,28 @@
+"Host ID","IP Address","Tracking Method","Network ID","Operating System","DNS Name","Netbios Name","QG HostID","Last Scan Datetime","OS CPE","Last VM Scanned Date","Last VM Scanned Duration","Last VM Auth Scanned Date","Last VM Auth Scanned Duration","QID","Type","Port","Protocol","FQDN","SSL","Instance","Status","Severity","First Found Datetime","Last Found Datetime","Last Test Datetime","Last Update Datetime","Last Fixed Datetime","Results","Ignored","Disabled","Times Found","Service","Last Processed Datetime"
+"1","10.20.1.11","AGENT","","Ubuntu Linux 22.04.5","web-prd-01","","","","","","","","","6877835","Confirmed","","","","","","Active","5","2026-10-01T10:00:00Z","","","","","Package	Installed Version	Required Version
+linux	6.8.0-1066-gcp	6.8.0-1073","","","","",""
+"1","10.20.1.11","AGENT","","Ubuntu Linux 22.04.5","web-prd-01","","","","","","","","","6800001","Confirmed","","","","","","Active","4","2026-10-01T10:00:00Z","","","","","Package	Installed Version	Required Version
+libxml2	2.9.13+dfsg-1ubuntu0.4	2.9.13+dfsg-1ubuntu0.6
+libxml2-utils	2.9.13+dfsg-1ubuntu0.4	2.9.13+dfsg-1ubuntu0.6","","","","",""
+"1","10.20.1.11","AGENT","","Ubuntu Linux 22.04.5","web-prd-01","","","","","","","","","6800002","Confirmed","","","","","","Active","5","2026-10-01T10:00:00Z","","","","","Package	Installed Version	Required Version
+nginx	1.18.0-6ubuntu14.4	1.18.0-6ubuntu14.6","","","","",""
+"1","10.20.1.11","AGENT","","Ubuntu Linux 22.04.5","web-prd-01","","","","","","","","","5001508","Confirmed","","","","","","Active","5","2026-10-01T10:00:00Z","","","","","laravel/framework 10.0 vulnerable","","","","",""
+"1","10.20.1.11","AGENT","","Ubuntu Linux 22.04.5","web-prd-01","","","","","","","","","6800003","Confirmed","","","","","","Fixed","5","2026-10-01T10:00:00Z","","","","","Package Installed Version Required Version
+curl 7.81.0-1ubuntu1.15 7.81.0-1ubuntu1.18","","","","",""
+"2","10.20.1.21","AGENT","","Ubuntu Linux 22.04.5","web-hml-01","","","","","","","","","6877835","Confirmed","","","","","","New","5","2026-10-01T10:00:00Z","","","","","Package	Installed Version	Required Version
+linux	6.8.0-1066-gcp	6.8.0-1073","","","","",""
+"2","10.20.1.21","AGENT","","Ubuntu Linux 22.04.5","web-hml-01","","","","","","","","","6800002","Confirmed","","","","","","Active","5","2026-10-01T10:00:00Z","","","","","Package	Installed Version	Required Version
+nginx	1.18.0-6ubuntu14.4	1.18.0-6ubuntu14.6","","","","",""
+"2","10.20.1.21","AGENT","","Ubuntu Linux 22.04.5","web-hml-01","","","","","","","","","38001","Confirmed","","","","","","Active","4","2026-10-01T10:00:00Z","","","","","Package Installed Version Required Version
+telnet 0.17-44build1 0","","","","",""
+"3","10.20.4.15","AGENT","","Rocky Linux 8.10","proxy-prd-01","","","","","","","","","354001","Confirmed","","","","","","Re-Opened","4","2026-10-01T10:00:00Z","","","","","Package Installed Version Required Version
+openssl-libs 1:1.1.1k-12.el8_9 1:1.1.1k-14.el8_10
+sudo 1.9.5p2-1.el8_9 1.9.5p2-1.el8_10","","","","",""
+"4","10.20.5.54","AGENT","","Windows Server 2025","win-web-prd-01.corp.example.local","","","","","","","","","92378","Confirmed","","","","","","Active","4","2026-10-01T10:00:00Z","","","","","%windir%\System32\mscoree.dll Version is 4.8.9300","","","","",""
+"5","10.10.10.10","AGENT","","Debian Linux 12.15","maquina-nova","","","","","","","","","178001","Confirmed","","","","","","Active","4","2026-10-01T10:00:00Z","","","","","Package Installed Version Required Version
+bind9 1:9.18.24 1:9.18.33","","","","",""
+"6","10.20.5.30","AGENT","","Windows Server 2025","win-app-prd-01.corp.example.local","WIN-APP-PRD-01","","","","","","","","91001","Confirmed","","","","","","Active","5","2026-10-01T10:00:00Z","","","","","KB5046617 is not installed
+%windir%\System32\ntoskrnl.exe Version is 10.0.26100.2033","","","","",""
+"6","10.20.5.30","AGENT","","Windows Server 2025","win-app-prd-01.corp.example.local","WIN-APP-PRD-01","","","","","","","","370001","Confirmed","","","","","","Active","4","2026-10-01T10:00:00Z","","","","","C:\Program Files\Google\Chrome\Application\chrome.exe Version is 129.0.6668.90","","","","",""
+"6","10.20.5.30","AGENT","","Windows Server 2025","win-app-prd-01.corp.example.local","WIN-APP-PRD-01","","","","","","","","38170","Confirmed","","","","","","Active","4","2026-10-01T10:00:00Z","","","","","Certificate #0 CN=win-app-prd-01","","","","",""
+"6","10.20.5.30","AGENT","","Windows Server 2025","win-app-prd-01.corp.example.local","WIN-APP-PRD-01","","","","","","","","110450","Confirmed","","","","","","Active","4","2026-10-01T10:00:00Z","","","","","C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE Version is 16.0.18025.20104","","","","",""

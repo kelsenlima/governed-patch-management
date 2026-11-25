@@ -1,0 +1,271 @@
+---
+# =============================================================================
+# Descobrir serviços e URLs de saúde — WINDOWS SERVER (SOMENTE LEITURA)
+#
+# Para cada servidor do inventories/windows.yml:
+#   - serviços em execução com início Automático que NÃO são do Windows
+#     (executável fora de C:\Windows) nem agentes (Qualys, Trend Micro, Stellar Cyber,
+#     Grafana Alloy, nuvem, backup, monitoração)
+#   - IIS: cada site, estado, pool e bindings; os sites INICIADOS são testados pelo
+#     próprio binding (IP + porta + nome de host), porque o IIS responde 400 para
+#     127.0.0.1 quando o site está amarrado a um host/IP
+#   - demais portas TCP em escuta (fora do HTTP.sys/IIS): processo dono e teste http/https
+# Gera no agente:
+#   out/descoberta-windows/<servidor>.yml   → sugestão de host_vars
+#   out/descoberta-windows.md               → resumo (aba Summary da run)
+#
+# Nada é alterado no servidor.
+#   WINRM_USER=... WINRM_PASSWORD=... ansible-playbook -i inventories/windows.yml \
+#     playbooks/descobrir_servicos_windows.yml -e alvo=nao_producao
+# =============================================================================
+- name: Descobrir serviços de aplicação e URLs de saúde (Windows)
+  hosts: "{{ alvo | default('nao_producao') }}"
+  gather_facts: false
+  vars:
+    dir_saida: "{{ playbook_dir }}/../out/descoberta-windows"
+    # agentes e serviços de infraestrutura que não são aplicação
+    ignorar_regex: >-
+      (?i)qualys|trend|deep security|ds_agent|amsp|tmxbc|tmbmserver|tmccsf|tmlisten|ntrtscan|vls_agent|
+      stellar|aella|crowdstrike|csfalcon|sentinel|cylance|defender|sense|wazuh|ossec|osquery|
+      google|gce|azure|rdagent|waagent|windowsazure|huawei|uniagent|hostguard|cloudbase|amazon|ssm|
+      vmware|vmtools|qemu|xen|zabbix|telegraf|nxlog|splunk|datadog|elastic|winlogbeat|metricbeat|
+      alloy|grafana|prometheus|windows_exporter|fluent|otelcol|opentelemetry|^dsa$|^dsa_|ds_monitor|
+      wincollect|^ClickToRunSvc$|^SQLWriter$|^CloudService$|^CloudMonitorService$|
+      veeam|backup exec|commvault|snow|lansweeper|ocs inventory|teamviewer|anydesk|chocolatey|
+      ^gupdate|^edgeupdate|^MozillaMaintenance|^AdobeARMservice|^ssh-agent|^sshd$
+    # portas que não são aplicação (RPC, SMB, RDP, WinRM, AD/DNS, agentes)
+    ignorar_portas: [53, 88, 135, 139, 389, 445, 464, 593, 636, 3268, 3269, 3389, 5985, 5986, 9389, 10001, 12345, 47001]
+    health_status_ok: [200, 204, 301, 302, 401, 403]
+
+  tasks:
+    - name: Coletar serviços, IIS, portas e testar HTTP local
+      ansible.windows.win_powershell:
+        script: |
+          $Ansible.Changed = $false
+          $ErrorActionPreference = 'SilentlyContinue'
+          $ProgressPreference = 'SilentlyContinue'
+          $ignorar = '{{ ignorar_regex | replace("\n", "") | replace("| ", "|") }}'
+          $pularPortas = @({{ ignorar_portas | join(',') }})
+          [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+
+          # Requisição HTTP com cabeçalho Host (IIS exige o nome do binding); devolve o código ou 0
+          function Testar-Url([string]$url, [string]$hostHeader, [int]$ms = 5000) {
+            try {
+              $req = [Net.HttpWebRequest]::Create($url)
+              $req.Method = 'GET'; $req.Timeout = $ms; $req.ReadWriteTimeout = $ms; $req.AllowAutoRedirect = $false
+              if ($hostHeader) { $req.Host = $hostHeader }
+              $resp = $req.GetResponse(); $cod = [int]$resp.StatusCode; $resp.Close(); return $cod
+            } catch [Net.WebException] {
+              if ($_.Exception.Response) { $cod = [int]$_.Exception.Response.StatusCode; $_.Exception.Response.Close(); return $cod }
+              return 0
+            } catch { return 0 }
+          }
+
+          # --- serviços de aplicação: rodando, início automático, fora de C:\Windows, não-agente
+          $app = @()
+          foreach ($s in (Get-CimInstance Win32_Service | Where-Object { $_.State -eq 'Running' -and $_.StartMode -eq 'Auto' })) {
+            $exe = $s.PathName
+            if ($exe -match '^"([^"]+)"') { $exe = $Matches[1] } elseif ($exe -match '^(\S+)') { $exe = $Matches[1] }
+            if ($exe -match '^[A-Za-z]:\\Windows\\') { continue }
+            if ($s.Name -match $ignorar -or $s.DisplayName -match $ignorar -or $exe -match $ignorar) { continue }
+            $app += [pscustomobject]@{ nome = $s.Name; exibicao = $s.DisplayName; executavel = $exe }
+          }
+
+          # --- IIS: sites, estado e teste pelo binding (só sites iniciados)
+          $iis = @(); $iisAtivo = $false; $portasIis = @()
+          $ipsServidor = @(Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { $_.IPAddress })
+          $w3 = Get-Service -Name W3SVC -ErrorAction SilentlyContinue
+          if ($w3) {
+            $iisAtivo = ($w3.Status -eq 'Running')
+            Import-Module WebAdministration -ErrorAction SilentlyContinue
+            foreach ($w in (Get-Website)) {
+              $estado = [string]$w.State
+              $todos = @($w.bindings.Collection | Where-Object { $_.protocol -in @('http', 'https') })
+              $txt = ($todos | ForEach-Object { $_.protocol + ' ' + $_.bindingInformation }) -join '; '
+              $url = ''; $hostH = ''; $cod = 0
+              if ($todos.Count -gt 0) {
+                $b = $todos[0]
+                $partes = $b.bindingInformation.Split(':')      # ip:porta:host
+                $ip = $partes[0]; $porta = $partes[1]; $hn = $partes[2]
+                $portasIis += [int]$porta
+                $alvoIp = if ($ip -and $ip -ne '*') { $ip } else { '127.0.0.1' }
+                $url = "$($b.protocol)://$($alvoIp):$porta/"
+                $hostH = if ($hn) { $hn } else { '' }
+                if ($estado -eq 'Started') { $cod = Testar-Url $url $hostH }
+              }
+              # binding amarrado a um IP que NÃO existe mais no servidor (troca de IP/migração)
+              $ipInexistente = ($todos.Count -gt 0 -and $ip -and $ip -ne '*' -and ($ipsServidor -notcontains $ip))
+              $iis += [pscustomobject]@{ site = $w.Name; estado = $estado; pool = $w.applicationPool; bindings = $txt
+                                         url = $url; host = $hostH; codigo = $cod; ip_inexistente = $ipInexistente }
+            }
+          }
+
+          # --- 2ª tentativa (20 s) nos sites iniciados sem resposta: app pool ocioso demora a subir (partida a frio)
+          foreach ($x in ($iis | Where-Object { $_.estado -eq 'Started' -and $_.codigo -eq 0 -and $_.url })) {
+            $x.codigo = Testar-Url $x.url $x.host 20000
+            if ($x.codigo -gt 0) { $x | Add-Member -NotePropertyName lento -NotePropertyValue $true -Force }
+          }
+
+          # --- demais portas em escuta (sem RPC dinâmico, sem portas do IIS/HTTP.sys)
+          $portas = @(); $urls = @()
+          $escuta = Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -lt 49152 -and ($pularPortas -notcontains $_.LocalPort) } |
+                    Sort-Object LocalPort -Unique
+          foreach ($c in $escuta) {
+            $proc = (Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue).ProcessName
+            if ($proc -eq 'System' -or $portasIis -contains [int]$c.LocalPort) { continue }   # HTTP.sys / IIS: testado acima
+            if ($proc -match $ignorar) { continue }
+            $portas += "$($c.LocalPort) $proc"
+            foreach ($esq in @('http', 'https')) {
+              $u = "$($esq)://127.0.0.1:$($c.LocalPort)/"
+              $cod = Testar-Url $u ''
+              if ($cod -gt 0) { $urls += [pscustomobject]@{ url = $u; codigo = $cod; processo = $proc }; break }
+            }
+          }
+
+          [pscustomobject]@{
+            servicos = @($app); iis = @($iis); iis_ativo = $iisAtivo; urls = @($urls); portas = @($portas); ips = @($ipsServidor)
+            so = (Get-CimInstance Win32_OperatingSystem).Caption
+          } | ConvertTo-Json -Depth 4 -Compress
+      register: _coleta
+      changed_when: false
+      check_mode: false
+      tags: [coleta]
+
+    - name: Montar sugestão
+      ansible.builtin.set_fact:
+        _so: "{{ _dados.so | default('') }}"
+        _servicos: "{{ _dados.servicos | default([]) }}"
+        _iis: "{{ _dados.iis | default([]) }}"
+        _iis_ativo: "{{ _dados.iis_ativo | default(false) | bool }}"
+        _iis_iniciados: "{{ _dados.iis | default([]) | selectattr('estado', 'equalto', 'Started') | list }}"
+        # site do IIS "no ar" = respondeu pelo binding com qualquer código abaixo de 500
+        _iis_ok: >-
+          {{ _dados.iis | default([]) | selectattr('estado', 'equalto', 'Started')
+             | selectattr('codigo', 'ge', 100) | selectattr('codigo', 'lt', 500) | list }}
+        _iis_falha: >-
+          {{ _dados.iis | default([]) | selectattr('estado', 'equalto', 'Started')
+             | rejectattr('codigo', 'ge', 100) | list
+             + (_dados.iis | default([]) | selectattr('estado', 'equalto', 'Started') | selectattr('codigo', 'ge', 500) | list) }}
+        _portas: "{{ _dados.portas | default([]) }}"
+        _ips: "{{ _dados.ips | default([]) }}"
+        _urls_ok: >-
+          {{ _dados.urls | default([]) | selectattr('codigo', 'in', health_status_ok) | map(attribute='url') | list }}
+        _urls_outras: >-
+          {{ _dados.urls | default([]) | rejectattr('codigo', 'in', health_status_ok) | list }}
+      vars:
+        _dados: "{{ _coleta.output | first | from_json }}"
+
+    - name: Sugestão deste servidor (também no artefato "descoberta-windows")
+      ansible.builtin.debug:
+        msg:
+          - "SO: {{ _so }}"
+          - "servicos_criticos: {{ (['W3SVC', 'WAS'] if _iis_ativo and _iis_iniciados else []) + (_servicos | map(attribute='nome') | list) }}"
+          - "IIS: {{ _iis | length }} sites · {{ _iis_iniciados | length }} iniciados · {{ _iis_ok | length }} respondendo ({{ _iis_ok | selectattr('lento', 'defined') | list | length }} lentos) · {{ _iis_falha | length }} iniciados SEM resposta"
+          - "IIS sem resposta: {% for s in _iis_falha %}{{ s.site }} ({{ s.url }} host={{ s.host or '-' }} cod={{ s.codigo }}{{ ' IP-INEXISTENTE' if s.ip_inexistente | default(false) else '' }}) {% else %}-{% endfor %}"
+          - "IPs do servidor: {{ _ips | join(', ') }} · sites com binding em IP inexistente: {{ _iis | selectattr('ip_inexistente', 'defined') | selectattr('ip_inexistente') | map(attribute='site') | list | length }}"
+          - "health_urls (fora do IIS): {{ _urls_ok }}"
+          - "outras portas HTTP: {% for u in _urls_outras %}{{ u.url }} (HTTP {{ u.codigo }}, {{ u.processo }}) {% else %}-{% endfor %}"
+          - "portas em escuta (fora do IIS): {{ _portas | join(', ') }}"
+
+    - name: Pasta de saída no agente
+      ansible.builtin.file:
+        path: "{{ dir_saida }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      run_once: true
+      vars:
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+    - name: Gravar sugestão de host_vars
+      ansible.builtin.copy:
+        dest: "{{ dir_saida }}/{{ inventory_hostname }}.yml"
+        mode: "0644"
+        content: |
+          ---
+          # {{ inventory_hostname }} — {{ _so }}
+          # Sugestão gerada por playbooks/descobrir_servicos_windows.yml em {{ now(utc=true).strftime('%Y-%m-%d %H:%M') }} UTC.
+          # REVISAR com o responsável da aplicação.
+          {% if inventory_hostname in groups.get('controladores_dominio', []) %}
+          # CONTROLADOR DE DOMÍNIO: serviços essenciais são do Windows (NTDS, DNS, Netlogon, KDC) e não aparecem abaixo.
+          {% endif %}
+
+          # Serviços que precisam estar ativos antes e depois do patch
+          servicos_criticos:
+          {% if _iis_ativo and _iis_iniciados %}
+            - W3SVC    # IIS ({{ _iis_iniciados | length }} sites iniciados)
+            - WAS      # Windows Process Activation Service (IIS)
+          {% endif %}
+          {% for s in _servicos %}
+            - {{ s.nome }}    # {{ s.exibicao }}
+          {% endfor %}
+          {% if not (_iis_ativo and _iis_iniciados) and not _servicos %}
+            []
+          {% endif %}
+
+          # URLs fora do IIS que responderam com {{ health_status_ok | join('/') }} em 127.0.0.1
+          health_urls:
+          {% for u in _urls_ok %}
+            - {{ u }}
+          {% else %}
+            []
+          {% endfor %}
+
+          # Sites do IIS iniciados e respondendo pelo binding (url + cabeçalho Host)
+          health_iis:
+          {% for s in _iis_ok %}
+            - { site: "{{ s.site }}", url: "{{ s.url }}", host: "{{ s.host }}" }   # HTTP {{ s.codigo }}{{ ' · lento (subiu na 2ª tentativa)' if s.lento | default(false) else '' }}
+          {% else %}
+            []
+          {% endfor %}
+          {% if _iis_falha %}
+
+          # ATENÇÃO — sites iniciados que NÃO responderam nem com 20 s (já estão com problema ANTES de qualquer patch):
+          {% for s in _iis_falha %}
+          #   - {{ s.site }}  {{ s.url }} host={{ s.host or '-' }}  código={{ s.codigo }}{{ '  ← binding em IP que NÃO existe no servidor' if s.ip_inexistente | default(false) else '' }}
+          {% endfor %}
+          {% endif %}
+          {% set parados = _iis | selectattr('estado', 'ne', 'Started') | list %}
+          {% if parados %}
+
+          # Sites parados ({{ parados | length }}): {{ parados | map(attribute='site') | join(', ') }}
+          {% endif %}
+          {% if _urls_outras %}
+
+          # Responderam com outro código (avaliar caminho de health check):
+          {% for u in _urls_outras %}
+          #   - {{ u.url }}   → HTTP {{ u.codigo }} ({{ u.processo }})
+          {% endfor %}
+          {% endif %}
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+    - name: Montar descoberta-windows.md
+      ansible.builtin.copy:
+        dest: "{{ dir_saida }}/../descoberta-windows.md"
+        mode: "0644"
+        content: |
+          # Descoberta de serviços — Windows Server (somente leitura)
+
+          | Servidor | SO | Serviços de aplicação | IIS (sites) | IIS respondendo | IIS iniciado SEM resposta | Outras URLs de saúde |
+          |---|---|---|---|---|---|---|
+          {% for h in ansible_play_hosts_all | sort if hostvars[h]._servicos is defined %}
+          {% set v = hostvars[h] %}
+          | {{ h }}{{ ' (DC)' if h in groups.get('controladores_dominio', []) else '' }} | {{ v._so | replace('Microsoft Windows ', '') }} | {{ ((['W3SVC', 'WAS'] if v._iis_ativo and v._iis_iniciados else []) + (v._servicos | map(attribute='nome') | list)) | join(', ') or '—' }} | {{ (v._iis | length ~ ' (' ~ v._iis_iniciados | length ~ ' iniciados)') if v._iis else '—' }} | {{ v._iis_ok | length if v._iis else '—' }} | {{ v._iis_falha | map(attribute='site') | join(', ') or '—' }} | {{ v._urls_ok | join('<br>') or '—' }} |
+          {% endfor %}
+          {% set falhos = ansible_play_hosts_all | difference(ansible_play_hosts) %}
+          {% if falhos %}
+
+          **Sem resposta / falha de conexão:** {{ falhos | join(', ') }}
+          {% endif %}
+
+          Detalhe por site (URL, Host e código) no artefato **descoberta-windows**.
+      delegate_to: localhost
+      run_once: true
+      vars:
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"

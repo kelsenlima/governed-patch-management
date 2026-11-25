@@ -1,0 +1,9 @@
+---
+# win-dc-01 — controlador de domínio (EXEMPLO). Serviços do AD colocados à mão:
+# se algum estiver parado ANTES, a esteira para no pré-check e não mexe no servidor.
+servicos_criticos:
+  - NTDS
+  - Netlogon
+  - Kdc
+  - DNS
+  - W32Time

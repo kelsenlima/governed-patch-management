@@ -1,0 +1,581 @@
+---
+# =============================================================================
+# Role patch_windows (W2) — aplica no servidor Windows o que o plano (out/plano.json,
+# seção "windows") apontou, via Windows Update.
+#
+# Princípios:
+#   - instala só atualizações do Windows Update nas categorias de segurança
+#     (SecurityUpdates, CriticalUpdates, UpdateRollups); nunca upgrade de versão;
+#   - pré-check: disco, reboot pendente, serviços críticos e URLs/sites IIS de saúde;
+#   - reboot só com patch_win_permitir_reboot (não-produção, ou produção na 🪟 janela);
+#   - pós-check: serviços críticos e saúde da aplicação voltam (com tentativas);
+#   - Microsoft fora do Windows Update (.NET Core/ASP.NET Core, Office...), terceiros
+#     (Chrome...) e configuração NÃO são tratados aqui: viram aviso no resultado;
+#   - falha não faz rollback automático: alerta e para o lote (patch real).
+#
+# Modo simulação (pipeline "🧪 Simular" = ansible-playbook --check --diff):
+#   - não instala e não reinicia nada; pré-checks rodam de verdade (só leitura);
+#   - a busca do Windows Update lista cada atualização que SERIA instalada.
+# =============================================================================
+
+- name: Plano deste servidor
+  ansible.builtin.set_fact:
+    _w: "{{ (plano.windows | default({}))[inventory_hostname] | default({}) }}"
+
+- name: Sem itens no plano para este servidor
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: nada a fazer (sem detecções 4/5 no plano)."
+  when: _w | length == 0
+
+- name: Executar patch Windows
+  when: _w | length > 0
+  block:
+    - name: Montar parâmetros desta execução
+      ansible.builtin.set_fact:
+        # "| bool" é obrigatório: valores vindos de -e chegam como texto ("False" é verdadeiro no Jinja)
+        _instalar: "{{ (patch_win_instalar | bool) and not ansible_check_mode }}"
+        _pode_reboot: "{{ (patch_win_permitir_reboot | bool) and not ansible_check_mode }}"
+        _kbs_plano: "{{ _w.kbs | default([]) }}"
+        _fora_wu: "{{ _w.itens | default([]) | rejectattr('classe', 'eq', 'WINDOWS_UPDATE') | list }}"
+        _avisos: []
+        _resultado:
+          host: "{{ inventory_hostname }}"
+          ambiente: "{{ _w.ambiente | default('') }}"
+          sistema: windows
+          simulacao: "{{ ansible_check_mode }}"
+          inicio: "{{ now(utc=true).isoformat() }}"
+          pacotes_atualizados: []
+          mudancas_previstas: []
+          reboot: false
+          reboot_previsto: false
+          reboot_pendente: false
+          servicos_parados: []
+          avisos: []
+          status: "em_andamento"
+
+    - name: Resumo do que será feito
+      ansible.builtin.debug:
+        msg:
+          - "Servidor: {{ inventory_hostname }} ({{ _w.ambiente | default('?') }}) · {{ _w.so | default('') }}"
+          - "Plano: {{ _w.criticas | default(0) }} críticas + {{ _w.altas | default(0) }} altas · por classe: {{ _w.por_classe | default({}) }}"
+          - "KBs apontadas pelo Qualys: {{ _kbs_plano | join(', ') or '-' }}"
+          - "Instalar nesta execução: {{ _instalar }} · reboot permitido: {{ _pode_reboot }} · simulação: {{ ansible_check_mode }}"
+          - "Categorias: {{ patch_win_categorias | join(', ') }}{{ ' · somente KBs do plano' if patch_win_somente_kbs_do_plano | bool else '' }}"
+
+    # ------------------------------------------------------------------ pré-checks
+    - name: Pré-check — estado do servidor (SO, build, disco, reboot pendente, serviços, saúde)
+      ansible.windows.win_powershell:
+        script: "{{ lookup('ansible.builtin.file', 'estado.ps1') }}"
+        parameters:
+          Servicos: "{{ servicos_criticos }}"
+          Urls: "{{ health_urls }}"
+          Iis: "{{ health_iis }}"
+          CodigosOk: "{{ health_status_ok }}"
+      register: _antes
+      check_mode: false
+
+    - name: Estado antes
+      ansible.builtin.set_fact:
+        _ea: "{{ _antes.result }}"
+        _resultado: >-
+          {{ _resultado | combine({
+               'kernel_antes': _antes.result.build,
+               'so': _antes.result.so,
+               'disco_livre_gb': _antes.result.disco_livre_gb,
+               'reboot_pendente_antes': _antes.result.reboot_pendente
+             }) }}
+
+    - name: Estado antes (resumo)
+      ansible.builtin.debug:
+        msg:
+          - "{{ _ea.so }} · build {{ _ea.build }} · disco livre {{ _ea.disco_livre_gb }} GB · último boot {{ _ea.ultimo_boot }}"
+          - "Reboot pendente antes do patch: {{ _ea.reboot_pendente | join(', ') or 'não' }}"
+          - "Serviços críticos parados: {{ _ea.servicos_parados | join(', ') or '-' }} · inexistentes: {{ _ea.servicos_inexistentes | join(', ') or '-' }}"
+          - "URLs/sites IIS com falha: {{ _ea.urls_falha | join(' | ') or '-' }}"
+          - "Política do Windows Update (GPO): {{ _ea.politica_wu | default({}) | to_json }}"
+
+    - name: Pré-check — espaço livre no disco do sistema
+      ansible.builtin.assert:
+        that: (_ea.disco_livre_gb | float) >= (patch_win_disco_min_gb | float)
+        fail_msg: >-
+          Disco do sistema com {{ _ea.disco_livre_gb }} GB livres (mínimo {{ patch_win_disco_min_gb }} GB).
+          Liberar espaço (ex.: Limpeza de Disco / DISM /StartComponentCleanup) antes do patch.
+        quiet: true
+
+    - name: Pré-check — serviços críticos ativos ANTES do patch
+      ansible.builtin.assert:
+        that:
+          - _ea.servicos_parados | length == 0
+          - _ea.servicos_inexistentes | length == 0
+        fail_msg: >-
+          Serviços críticos já com problema ANTES do patch (não é da esteira) —
+          parados: {{ _ea.servicos_parados | join(', ') or '-' }};
+          inexistentes: {{ _ea.servicos_inexistentes | join(', ') or '-' }}.
+          Corrigir ou ajustar servicos_criticos no host_vars.
+        quiet: true
+
+    - name: Pré-check — aplicação respondendo ANTES do patch
+      ansible.builtin.assert:
+        that: _ea.urls_falha | length == 0
+        fail_msg: >-
+          Aplicação já sem resposta ANTES do patch: {{ _ea.urls_falha | join(' | ') }}.
+          Corrigir ou ajustar health_urls / health_iis no host_vars.
+        quiet: true
+
+    # Servidor com Windows Update gerenciado pelo Qualys Patch Management: a GPO aponta para "WSUS" sem
+    # endereço (UseWUServer=1 sem WUServer) e bloqueia a internet (DoNotConnectToWindowsUpdateInternetLocations=1).
+    # Nesse servidor a esteira NÃO usa o Windows Update (seria erro 0x8024500C/0x80244011); os demais seguem normal.
+    - name: Windows Update — este servidor usa? (Qualys Patch Management detectado pela GPO)
+      ansible.builtin.set_fact:
+        _wu_qualys: >-
+          {{ (_ea.politica_wu | default({})).UseWUServer | default('0') == '1'
+             and ((_ea.politica_wu | default({})).WUServer | default('')) | length == 0
+             and (_ea.politica_wu | default({})).DoNotConnectToWindowsUpdateInternetLocations | default('0') == '1' }}
+
+    - name: Windows Update — decisão para este servidor
+      ansible.builtin.set_fact:
+        _usar_wu: "{{ (patch_win_windows_update | bool) and not (_wu_qualys | bool) }}"
+
+    - name: Aviso — reboot já pendente antes do patch
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + ['Servidor já estava com reboot pendente antes do patch (' ~ (_ea.reboot_pendente | join(', ')) ~ ')'
+             ~ ('; reinicia antes de instalar só se houver atualização do Windows a instalar.' if (_pode_reboot | bool) and (_usar_wu | bool)
+                else '; a esteira não reinicia (Windows Update deste servidor é do Qualys Patch Management).' if not (_usar_wu | bool)
+                else '; sem reboot permitido nesta execução, a instalação pode falhar ou ficar incompleta.')] }}
+      when: _ea.reboot_pendente | length > 0
+
+    # ------------------------------------------------------------------ Windows Update
+    # Fonte do Windows Update: tenta a configurada no servidor; se a política bloquear (ex.: 0x8024500C,
+    # "redirector disallowed by managed policy"), tenta direto no Microsoft Update e depois no WSUS.
+    - name: Windows Update — buscar atualizações (fonte padrão do servidor; só leitura)
+      ansible.windows.win_updates:
+        state: searched
+        server_selection: default
+        category_names: "{{ patch_win_categorias }}"
+        accept_list: "{{ _kbs_plano if (patch_win_somente_kbs_do_plano | bool and _kbs_plano | length > 0) else omit }}"
+        reject_list: "{{ patch_win_rejeitar }}"
+        log_path: C:\Windows\Temp\ansible-patch-qualys-wu.log
+      register: _wu_b1
+      ignore_errors: true
+      check_mode: false
+      when: _usar_wu | bool
+
+    - name: Windows Update — buscar direto no Microsoft Update (fonte padrão falhou)
+      ansible.windows.win_updates:
+        state: searched
+        server_selection: windows_update
+        category_names: "{{ patch_win_categorias }}"
+        accept_list: "{{ _kbs_plano if (patch_win_somente_kbs_do_plano | bool and _kbs_plano | length > 0) else omit }}"
+        reject_list: "{{ patch_win_rejeitar }}"
+        log_path: C:\Windows\Temp\ansible-patch-qualys-wu.log
+      register: _wu_b2
+      ignore_errors: true
+      check_mode: false
+      when: _wu_b1 is failed
+
+    - name: Windows Update — buscar no WSUS (managed_server; as anteriores falharam)
+      ansible.windows.win_updates:
+        state: searched
+        server_selection: managed_server
+        category_names: "{{ patch_win_categorias }}"
+        accept_list: "{{ _kbs_plano if (patch_win_somente_kbs_do_plano | bool and _kbs_plano | length > 0) else omit }}"
+        reject_list: "{{ patch_win_rejeitar }}"
+        log_path: C:\Windows\Temp\ansible-patch-qualys-wu.log
+      register: _wu_b3
+      ignore_errors: true
+      check_mode: false
+      when:
+        - _wu_b1 is failed
+        - _wu_b2 is failed
+
+    - name: Windows Update — fonte usada
+      ansible.builtin.set_fact:
+        _wu_fonte: >-
+          {{ 'desligado' if not (_usar_wu | bool) else 'default' if _wu_b1 is not failed else ('windows_update' if _wu_b2 is not failed
+             else ('managed_server' if _wu_b3 is not failed else '')) }}
+        _wu_busca: >-
+          {{ {} if not (_usar_wu | bool) else _wu_b1 if _wu_b1 is not failed else (_wu_b2 if _wu_b2 is not failed
+             else (_wu_b3 if _wu_b3 is not failed else {})) }}
+
+    - name: Aviso — fonte padrão do Windows Update bloqueada, usada outra
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + ['Fonte padrão do Windows Update falhou (' ~ (_wu_b1.msg | default('') | truncate(140))
+             ~ '); usada a fonte "' ~ _wu_fonte ~ '". Política WU no servidor: ' ~ (_ea.politica_wu | default({}) | to_json)] }}
+      when:
+        - _wu_b1 is failed
+        - _wu_fonte | length > 0
+
+    - name: Aviso — Windows Update deste servidor fora da esteira
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + [((_w.por_classe | default({})).WINDOWS_UPDATE | default(0)) ~ ' detecção(ões) de KB do Windows não tratadas pela esteira: '
+             ~ ('Windows Update gerenciado pelo Qualys Patch Management (GPO: WSUS sem endereço + internet bloqueada).'
+                if _wu_qualys | bool else 'patch_win_windows_update: false neste servidor.')] }}
+      when:
+        - not (_usar_wu | bool)
+        - ((_w.por_classe | default({})).WINDOWS_UPDATE | default(0) | int) > 0
+
+    - name: Windows Update indisponível — registrar (W2b ainda roda)
+      ansible.builtin.set_fact:
+        _wu_erro: >-
+          Windows Update inacessível em todas as fontes (padrão, Microsoft Update, WSUS).
+          Padrão: {{ _wu_b1.msg | default('') | truncate(160) }}.
+          Política WU (HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate): {{ _ea.politica_wu | default({}) | to_json }}.
+          Ver GPO de Windows Update do servidor (WSUS / "Do not connect to any Windows Update Internet locations").
+      when: _wu_fonte | length == 0
+
+    - name: Atualizações encontradas
+      ansible.builtin.set_fact:
+        _wu_previstas: >-
+          {{ (_wu_busca.updates | default({})) | dict2items | map(attribute='value')
+             | map(attribute='title') | list | sort }}
+        _resultado: >-
+          {{ _resultado | combine({
+               'mudancas_previstas': (_wu_busca.updates | default({})) | dict2items | map(attribute='value')
+                                     | map(attribute='title') | list | sort,
+               'reboot_previsto': (_wu_busca.found_update_count | default(0) | int) > 0
+             }) }}
+
+    - name: Atualizações que seriam / serão instaladas
+      ansible.builtin.debug:
+        msg: "{{ _wu_previstas or ['nenhuma atualização disponível nas categorias configuradas'] }}"
+
+    - name: Reiniciar antes de instalar (reboot já pendente)
+      ansible.windows.win_reboot:
+        reboot_timeout: "{{ patch_win_reboot_timeout }}"
+        msg: "Reboot pendente antes do patch (ansible-patch-qualys)"
+      register: _reboot_antes
+      when:
+        - _ea.reboot_pendente | length > 0
+        - _pode_reboot | bool
+        - _instalar | bool
+        - _usar_wu | bool
+        - _wu_previstas | length > 0   # só reinicia se houver o que instalar
+
+    - name: Aviso — produção sem janela não instala
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + [(_wu_previstas | length) ~ ' atualização(ões) disponível(is), não instalada(s): '
+             ~ 'em produção o Windows só instala dentro da 🪟 janela de manutenção (atualização pede reboot).'] }}
+      when:
+        - not ansible_check_mode
+        - not (patch_win_instalar | bool)
+        - _wu_previstas | length > 0
+
+    - name: Windows Update — instalar
+      ansible.windows.win_updates:
+        state: installed
+        server_selection: "{{ _wu_fonte if _wu_fonte in ['default', 'windows_update', 'managed_server'] else 'default' }}"
+        category_names: "{{ patch_win_categorias }}"
+        accept_list: "{{ _kbs_plano if (patch_win_somente_kbs_do_plano | bool and _kbs_plano | length > 0) else omit }}"
+        reject_list: "{{ patch_win_rejeitar }}"
+        reboot: "{{ _pode_reboot | bool }}"
+        reboot_timeout: "{{ patch_win_reboot_timeout }}"
+        log_path: C:\Windows\Temp\ansible-patch-qualys-wu.log
+      register: _wu
+      when:
+        - _instalar | bool
+        - _wu_previstas | length > 0
+
+    - name: Atualizações instaladas
+      ansible.builtin.set_fact:
+        _resultado: >-
+          {{ _resultado | combine({
+               'pacotes_atualizados': (_wu.updates | default({})) | dict2items | map(attribute='value')
+                                      | selectattr('installed', 'defined') | selectattr('installed')
+                                      | map(attribute='title') | list | sort,
+               'falhas_instalacao': _wu.failed_update_count | default(0),
+               'reboot': (_wu.rebooted | default(false)) or (_reboot_antes.rebooted | default(false)),
+               'reboot_pendente': _wu.reboot_required | default(false)
+             }) }}
+      when: _wu is defined and _wu is not skipped
+
+    - name: Aviso — reboot pendente (não permitido nesta execução)
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + ['Atualizações instaladas, mas o servidor precisa REINICIAR para concluir (reboot não permitido nesta execução). '
+             ~ 'Até o reboot as vulnerabilidades continuam abertas.'] }}
+      when: _resultado.reboot_pendente | default(false) | bool
+
+    - name: Falha — atualização que o Windows Update não instalou
+      ansible.builtin.fail:
+        msg: >-
+          {{ _wu.failed_update_count }} atualização(ões) falharam na instalação (ver C:\Windows\Temp\ansible-patch-qualys-wu.log
+          e Get-WindowsUpdateLog no servidor).
+      when: (_wu.failed_update_count | default(0) | int) > 0
+
+    # ------------------------------------------------------------------ pós-checks
+    - name: Pós-check — serviços críticos e aplicação de volta (com tentativas)
+      ansible.windows.win_powershell:
+        script: "{{ lookup('ansible.builtin.file', 'estado.ps1') }}"
+        parameters:
+          Servicos: "{{ servicos_criticos }}"
+          Urls: "{{ health_urls }}"
+          Iis: "{{ health_iis }}"
+          CodigosOk: "{{ health_status_ok }}"
+      register: _depois
+      check_mode: false
+      until: >-
+        _depois.result is defined
+        and _depois.result.servicos_parados | length == 0
+        and _depois.result.urls_falha | length == 0
+      retries: "{{ 1 if not (_resultado.reboot | default(false) | bool) else patch_win_servicos_tentativas }}"
+      delay: "{{ patch_win_servicos_intervalo }}"
+      failed_when: false
+
+    - name: Estado depois
+      ansible.builtin.set_fact:
+        _ed: "{{ _depois.result | default({}) }}"
+
+    - name: Serviços automáticos que rodavam antes e não voltaram
+      ansible.builtin.set_fact:
+        _svc_nao_voltaram: >-
+          {{ (_ea.auto_rodando | default([])) | difference(_ed.auto_rodando | default([]))
+             | reject('match', patch_win_servicos_ignorar | replace('\n', '') | replace(' ', '')) | list }}
+
+    - name: Aviso — serviços automáticos que não voltaram (não críticos)
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + ['Serviços automáticos que rodavam antes e não estão rodando depois (não estão em servicos_criticos): '
+             ~ (_svc_nao_voltaram | join(', ')) ~ '. Conferir se é esperado.'] }}
+      when: _svc_nao_voltaram | length > 0
+
+    - name: KBs do plano ainda ausentes no servidor
+      ansible.builtin.set_fact:
+        _kbs_ausentes: "{{ _kbs_plano | difference(_ed.kbs_instaladas | default([])) }}"
+
+    - name: Aviso — KBs do plano não aparecem instaladas
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + ['KBs apontadas pelo Qualys que não aparecem em Get-HotFix: ' ~ (_kbs_ausentes | join(', '))
+             ~ '. Normal quando foram substituídas por cumulativa mais nova; o próximo scan do Qualys confirma.'] }}
+      when:
+        - not ansible_check_mode
+        - _kbs_ausentes | length > 0
+        - _instalar | bool
+
+    # ------------------------------------------------------------------ W2b — terceiros
+    - name: W2b — títulos do plano por produto do catálogo
+      ansible.builtin.set_fact:
+        _terc_alvo: []
+        _terc_exec: {}
+
+    # Cada entrada olha só as classes dela (padrão TERCEIROS; o Office olha MICROSOFT_APP)
+    - name: W2b — produtos do catálogo apontados pelo Qualys neste servidor
+      ansible.builtin.set_fact:
+        _terc_alvo: >-
+          {{ _terc_alvo + [item | combine({'deteccoes': _titulos_item | length, 'titulos': _titulos_item})] }}
+      vars:
+        _titulos_item: >-
+          {{ _w.itens | default([]) | selectattr('classe', 'in', item.classes | default(['TERCEIROS']))
+             | map(attribute='titulo') | select('search', item.regex_qualys) | list }}
+      loop: "{{ patch_win_terceiros_catalogo }}"
+      loop_control:
+        label: "{{ item.nome }}"
+      when:
+        - patch_win_terceiros | bool
+        - _titulos_item | length > 0
+
+    - name: W2b — versão instalada antes (só leitura)
+      ansible.windows.win_powershell:
+        script: "{{ lookup('ansible.builtin.file', 'versoes.ps1') }}"
+        parameters:
+          Produtos: "{{ _terc_alvo | map('dict2items') | map('selectattr', 'key', 'in', ['nome', 'tipo', 'regex_registro', 'caminho_perfil']) | map('items2dict') | list }}"
+      register: _terc_antes
+      check_mode: false
+      when: _terc_alvo | length > 0
+
+    # Presente = instalado para a máquina OU em algum perfil de usuário. Ausente: não instala nada.
+    - name: W2b — produtos presentes no servidor (máquina ou perfil de usuário)
+      ansible.builtin.set_fact:
+        _terc_instalados: >-
+          {{ _terc_alvo | selectattr('nome', 'in',
+               ((_terc_antes.result | default({})) | dict2items | selectattr('value.instalado') | map(attribute='key') | list)
+               + ((_terc_antes.result | default({})) | dict2items | selectattr('value.perfis') | map(attribute='key') | list)) | list }}
+      when: _terc_alvo | length > 0
+
+    - name: W2b — o que seria / será atualizado
+      ansible.builtin.set_fact:
+        _resultado: >-
+          {{ _resultado | combine({'mudancas_previstas': _resultado.mudancas_previstas + ['[W2b] ' ~ item.nome
+             ~ ((' ' ~ _terc_antes.result[item.nome].versao ~ ' → atualização pelo canal do Office (ClickToRun; fecha Word/Excel/Outlook abertos)')
+                if (item.tipo | default('pacote')) == 'office_c2r' else
+                (' ' ~ (_terc_antes.result[item.nome].versao or '') ~ ' → versão estável mais nova do fornecedor (instalador de máquina)'))
+             ~ ((' e remove ' ~ (_terc_antes.result[item.nome].perfis | length) ~ ' cópia(s) por usuário desatualizada(s) — '
+                 ~ 'o usuário passa a usar a de máquina, favoritos e perfil preservados')
+                if (_terc_antes.result[item.nome].perfis | default([]) | length) > 0 else '')]}) }}
+      loop: "{{ _terc_instalados | default([]) }}"
+      loop_control:
+        label: "{{ item.nome }}"
+
+    - name: W2b — atualizar produto de terceiros
+      ansible.builtin.include_tasks: terceiro.yml
+      loop: "{{ _terc_instalados | default([]) }}"
+      loop_control:
+        label: "{{ item.nome }} ({{ item.deteccoes }} detecções)"
+      when: _instalar | bool
+
+    - name: W2b — versão instalada depois (só leitura)
+      ansible.windows.win_powershell:
+        script: "{{ lookup('ansible.builtin.file', 'versoes.ps1') }}"
+        parameters:
+          Produtos: "{{ _terc_alvo | map('dict2items') | map('selectattr', 'key', 'in', ['nome', 'tipo', 'regex_registro', 'caminho_perfil']) | map('items2dict') | list }}"
+      register: _terc_depois
+      check_mode: false
+      when:
+        - _terc_alvo | length > 0
+        - _instalar | bool
+
+    - name: W2b — resultado por produto
+      ansible.builtin.set_fact:
+        _terc_res: >-
+          {{ _terc_res | default([]) + [{
+               'produto': item.nome,
+               'deteccoes': item.deteccoes,
+               'instalado': (_terc_antes.result | default({}))[item.nome].instalado | default(false),
+               'antes': (_terc_antes.result | default({}))[item.nome].versao | default(''),
+               'depois': ((_terc_depois.result | default({}))[item.nome] | default({})).versao | default(''),
+               'perfis': (_terc_antes.result | default({}))[item.nome].perfis | default([]),
+               'perfis_depois': ((_terc_depois.result | default({}))[item.nome] | default({})).perfis | default([]),
+               'detalhe': (_terc_antes.result | default({}))[item.nome].detalhe | default(''),
+               'aviso_ausente': item.aviso_ausente | default(''),
+               'titulos': item.titulos | default([]),
+               'execucao': (_terc_exec | default({}))[item.nome] | default({})
+             }] }}
+      loop: "{{ _terc_alvo }}"
+      loop_control:
+        label: "{{ item.nome }}"
+
+    - name: W2b — resumo
+      ansible.builtin.debug:
+        var: _terc_res
+      when: _terc_res is defined
+
+    - name: Aviso — W2b com falha, sem efeito ou cópias por usuário que ficaram
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + [item.produto ~ ': '
+             ~ ((item.aviso_ausente or ('Qualys aponta ' ~ item.deteccoes ~ ' detecção(ões), mas o produto não foi encontrado '
+                                         ~ 'no servidor (nem para a máquina nem em perfil de usuário): nada feito — pode ser cópia '
+                                         ~ 'embutida em outra aplicação; ver o caminho no Qualys'))
+                if (not item.instalado and item.perfis | length == 0) else
+                ('download ' ~ (item.execucao.download | default('-')) ~ '; instalação ' ~ (item.execucao.instalacao | default('-'))
+                 ~ '; versão ' ~ (item.antes or 'só por usuário') ~ ' → ' ~ (item.depois or '?')
+                 ~ ((' · cópias por usuário que ficaram (em uso ou com erro): ' ~ (item.perfis_depois | join(', ') | truncate(300))
+                     ~ ' — rodar de novo com o ' ~ item.produto ~ ' fechado nesses perfis') if item.perfis_depois | length > 0 else '')))] }}
+      loop: "{{ _terc_res | default([]) }}"
+      loop_control:
+        label: "{{ item.produto }}"
+      when: >-
+        (not item.instalado and item.perfis | length == 0)
+        or ((_instalar | bool) and (
+              (item.execucao.download | default('ok')) != 'ok'
+              or (item.execucao.instalacao | default('ok')) != 'ok'
+              or item.depois == item.antes
+              or item.perfis_depois | length > 0))
+
+    # Fora do Windows Update e fora do catálogo do W2b (ou produto do catálogo que não está no servidor)
+    - name: Itens do plano que a esteira não trata
+      ansible.builtin.set_fact:
+        _nao_tratados: >-
+          {{ _fora_wu | rejectattr('titulo', 'in',
+               _terc_alvo | selectattr('nome', 'in', (_terc_instalados | default([])) | map(attribute='nome') | list)
+               | map(attribute='titulos') | flatten | list) | list }}
+
+    - name: Aviso — itens do plano fora do Windows Update
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + [(_nao_tratados | length) ~ ' detecção(ões) fora do Windows Update, não tratadas pela esteira ('
+             ~ (_nao_tratados | map(attribute='classe') | unique | sort | join(', '))
+             ~ '). Ex.: ' ~ ((_nao_tratados | map(attribute='titulo') | unique | list | first | default('')) | truncate(120))] }}
+      when: _nao_tratados | length > 0
+
+    - name: Pós-check — serviços críticos e aplicação no ar DEPOIS do patch
+      ansible.builtin.assert:
+        that:
+          - _ed.servicos_parados | default(['sem resposta do servidor']) | length == 0
+          - _ed.urls_falha | default(['sem resposta do servidor']) | length == 0
+        fail_msg: >-
+          Depois do patch — serviços críticos parados: {{ _ed.servicos_parados | default(['?']) | join(', ') or '-' }};
+          aplicação sem resposta: {{ _ed.urls_falha | default(['?']) | join(' | ') or '-' }}.
+          Nenhum rollback automático: avaliar desinstalar a KB (wusa /uninstall /kb:NNNN) ou restaurar o snapshot.
+        quiet: true
+
+    - name: Falha — Windows Update inacessível
+      ansible.builtin.fail:
+        msg: "{{ _wu_erro }}"
+      when: _wu_erro is defined
+
+    - name: Resultado
+      ansible.builtin.set_fact:
+        _resultado: >-
+          {{ _resultado | combine({
+               'status': 'simulado' if ansible_check_mode else 'ok',
+               'kernel_depois': _ed.build | default(''),
+               'disco_livre_gb_depois': _ed.disco_livre_gb | default(''),
+               'reboot_pendente': (_ed.reboot_pendente | default([]) | length > 0) or (_resultado.reboot_pendente | default(false)),
+               'kbs_plano_ausentes': _kbs_ausentes | default([]),
+               'windows_update': ('qualys_pm' if _wu_qualys | default(false) | bool else ('esteira' if _usar_wu | default(false) | bool else 'desligado')),
+               'terceiros': _terc_res | default([]),
+               'avisos': _avisos,
+               'fim': now(utc=true).isoformat()
+             }) }}
+
+    - name: Resultado deste servidor
+      ansible.builtin.debug:
+        var: _resultado
+
+  rescue:
+    - name: Falha — registrar (sem rollback automático)
+      ansible.builtin.set_fact:
+        _resultado: >-
+          {{ (_resultado | default({'host': inventory_hostname, 'sistema': 'windows'})) | combine({
+               'status': 'falha',
+               'kernel_depois': (_ed | default({})).build | default(''),
+               'reboot': (_wu.rebooted | default(false)) or (_reboot_antes.rebooted | default(false)),
+               'servicos_parados': (_ed | default({})).servicos_parados | default([]),
+               'terceiros': _terc_res | default([]),
+               'avisos': _avisos | default([]),
+               'erro': (ansible_failed_result.msg | default('erro desconhecido')) | truncate(400),
+               'como_voltar': 'Sem rollback automático. Opções: desinstalar a KB (wusa /uninstall /kb:NNNN /norestart e reiniciar) '
+                              ~ 'ou restaurar o snapshot do disco.',
+               'fim': now(utc=true).isoformat()
+             }) }}
+
+    - name: Interromper o lote neste servidor
+      ansible.builtin.fail:
+        msg: "Patch Windows falhou em {{ inventory_hostname }}: {{ _resultado.erro }}. {{ _resultado.como_voltar }}"
+      # Simulação: a falha fica no resultado (status "falha") e os demais servidores seguem.
+      when: not ansible_check_mode
+
+    - name: Simulação — falha registrada, seguindo para os próximos servidores
+      ansible.builtin.debug:
+        msg: "SIMULAÇÃO: {{ inventory_hostname }} teria falhado ({{ _resultado.erro }}). Registrado no resultado."
+      when: ansible_check_mode
+
+  always:
+    - name: Pasta de resultados no agente
+      ansible.builtin.file:
+        path: "{{ patch_win_dir_resultado }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      check_mode: false
+      vars:
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      when: _w | length > 0
+
+    - name: Gravar resultado no agente
+      ansible.builtin.copy:
+        content: "{{ _resultado | default({'host': inventory_hostname, 'status': 'sem_itens'}) | to_nice_json }}"
+        dest: "{{ patch_win_dir_resultado }}/{{ inventory_hostname }}.json"
+        mode: "0600"
+      delegate_to: localhost
+      check_mode: false
+      vars:
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      when: _w | length > 0

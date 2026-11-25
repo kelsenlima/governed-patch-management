@@ -1,0 +1,117 @@
+---
+# =============================================================================
+# Role patch_windows (W2) — Windows Update guiado pelo plano do Qualys
+# =============================================================================
+
+# Windows Update (KBs) pela esteira. LIGADO; mas a esteira pula sozinha o servidor cujo Windows Update
+# é gerenciado pelo Qualys Patch Management (GPO com WSUS sem endereço + internet bloqueada) — nele só
+# pré/pós-check e W2b. Para desligar num servidor específico: patch_win_windows_update: false no host_vars.
+patch_win_windows_update: true
+
+# Instalar atualizações nesta execução. A pipeline liga em não-produção e, em produção,
+# só com 🪟 Janela de manutenção (atualização Windows quase sempre pede reboot).
+patch_win_instalar: false
+
+# Reiniciar quando a atualização pedir (e antes, se já havia reboot pendente)
+patch_win_permitir_reboot: false
+patch_win_reboot_timeout: 1800          # segundos para o servidor voltar após cada reboot
+
+# Categorias do Windows Update instaladas. Cumulativas mensais do Windows Server e do
+# .NET Framework vêm em SecurityUpdates. Nunca inclui upgrade de versão (Feature/Upgrades).
+patch_win_categorias:
+  - SecurityUpdates
+  - CriticalUpdates
+  - UpdateRollups
+
+# Só as KBs apontadas pelo Qualys no plano (true) ou todas as das categorias acima (false).
+# false é o recomendado: a KB do Qualys costuma ter sido substituída por uma cumulativa mais nova.
+patch_win_somente_kbs_do_plano: false
+
+# Atualizações que nunca entram (expressões regulares sobre o título)
+patch_win_rejeitar:
+  - '(?i)preview'
+  - '(?i)feature update'
+  - '(?i)upgrade to windows'
+
+# Pré-check: espaço livre mínimo no disco do sistema (GB)
+patch_win_disco_min_gb: 10
+
+# Pós-check: serviços críticos têm até (tentativas x intervalo) para voltar após o reboot
+patch_win_servicos_tentativas: 20
+patch_win_servicos_intervalo: 30
+
+# Comparação "serviços automáticos rodando antes × depois": nomes que não contam (regex)
+patch_win_servicos_ignorar: >-
+  (?i)^(TrustedInstaller|wuauserv|UsoSvc|BITS|DoSvc|WaaSMedicSvc|sppsvc|TiWorker|msiserver|
+  gupdate|gupdatem|edgeupdate|edgeupdatem|MapsBroker|RemoteRegistry|tiledatamodelsvc|
+  cbdhsvc_.*|CDPUserSvc_.*|OneSyncSvc_.*|WpnUserService_.*|PimIndexMaintenanceSvc_.*|
+  UnistoreSvc_.*|UserDataSvc_.*|BcastDVRUserService_.*|DevicesFlowUserSvc_.*|
+  CaptureService_.*|ConsentUxUserSvc_.*|CredentialEnrollmentManagerUserSvc_.*|
+  ShellHWDetection|Spooler|wisvc|InstallService|ClipSVC|LicenseManager|StorSvc|camsvc)$
+
+# Validação da aplicação (definir por servidor em inventories/host_vars/<servidor>.yml)
+servicos_criticos: []
+health_urls: []
+health_iis: []                          # [{site, url, host}] — gerado pelo 🔍 Descobrir serviços
+health_status_ok: [200, 204, 301, 302, 401, 403]
+
+# Onde gravar o resultado por servidor (no agente)
+patch_win_dir_resultado: "{{ playbook_dir }}/../out/resultado-windows"
+
+# =============================================================================
+# W2b — softwares de TERCEIROS apontados pelo Qualys (fora do Windows Update)
+# =============================================================================
+# Liga/desliga o W2b. Segue a mesma regra do Windows Update: só instala quando
+# patch_win_instalar=true (não-produção; produção só com 🪟 janela).
+patch_win_terceiros: true
+
+# Catálogo de produtos que a esteira sabe atualizar. Só age quando:
+#   (1) o plano tem detecção, numa das "classes" da entrada (padrão TERCEIROS), cujo título casa com "regex_qualys" E
+#   (2) o produto está PRESENTE no servidor (DisplayName casa com "regex_registro", ou cópia por usuário).
+# Nunca instala produto que não existe no servidor. Sem reboot.
+# Campos:
+#   tipo           pacote (padrão: baixa e instala o instalador oficial) | office_c2r (Office ClickToRun)
+#   url            instalador fixo do fornecedor (sempre a versão estável mais nova)
+#   url_pagina + url_regex + url_base   quando o link muda a cada versão: a esteira lê a página oficial
+#                  de download no servidor e monta a URL com o 1º link que casa com url_regex
+#   caminho_perfil cópia por usuário (C:\Users\<u>\...) que o instalador de máquina não atualiza
+#   aviso_ausente  texto do aviso quando o Qualys aponta o produto mas a esteira não o encontra
+patch_win_terceiros_catalogo:
+  - nome: Google Chrome
+    regex_qualys: '(?i)google chrome'
+    regex_registro: '^Google Chrome$'
+    url: https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi
+    arquivo: googlechromestandaloneenterprise64.msi
+    argumentos: /qn /norestart
+    caminho_perfil: AppData\Local\Google\Chrome\Application\chrome.exe
+
+  # Google Drive para computador (o mesmo pacote "googledrive" do Chocolatey)
+  - nome: Google Drive
+    regex_qualys: '(?i)google drive'
+    regex_registro: '^Google Drive$'
+    url: https://dl.google.com/drive-file-stream/GoogleDriveSetup.exe
+    arquivo: GoogleDriveSetup.exe
+    argumentos: --silent --gsuite_shortcuts=false
+
+  # 7-Zip (o mesmo pacote "7zip" do Chocolatey): o link tem a versão no nome, então vem da página oficial
+  - nome: 7-Zip
+    regex_qualys: '(?i)7-?zip'
+    regex_registro: '^7-Zip'
+    url_pagina: https://www.7-zip.org/download.html
+    url_regex: 'a/7z[0-9]+-x64\.msi'
+    url_base: https://www.7-zip.org/
+    arquivo: 7z-x64.msi
+    argumentos: /qn /norestart
+
+  # Office ClickToRun (Microsoft 365 Apps / Office 2019+): dispara a atualização pelo canal do próprio
+  # Office. FECHA Word/Excel/Outlook abertos no servidor.
+  # Office MSI (2013/2016 de volume) e versões fora de suporte (EOL) não entram: não há atualização.
+  - nome: Microsoft Office (ClickToRun)
+    tipo: office_c2r
+    classes: [MICROSOFT_APP]
+    regex_qualys: '(?i)^(?!.*\b(EOL|obsolete)\b).*microsoft (office|outlook|word|excel|powerpoint|access|onenote|publisher|visio|project|365 apps)'
+    regex_registro: ''
+    timeout_min: 45
+    aviso_ausente: >-
+      Office não é ClickToRun neste servidor (MSI/volume): a esteira não atualiza — atualizar pelo
+      Windows Update/Microsoft Update ou trocar pela versão ClickToRun

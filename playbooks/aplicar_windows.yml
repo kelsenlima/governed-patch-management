@@ -1,0 +1,29 @@
+---
+# =============================================================================
+# W2 — Patch Windows Server guiado pelo plano do Qualys (Windows Update).
+#
+# Credencial: WINRM_USER / WINRM_PASSWORD no ambiente (na pipeline vêm do grupo
+# windows-credentials: DOMAIN_USER / DOMAIN_PASS). Nunca na linha de comando.
+#
+# Simulação (lista o que seria instalado):
+#   ansible-playbook -i inventories/windows.yml playbooks/aplicar_windows.yml --check \
+#     -e alvo=producao --limit win-app-prd-01
+#
+# Não-produção (instala e reinicia):
+#   ansible-playbook -i inventories/windows.yml playbooks/aplicar_windows.yml \
+#     -e alvo=nao_producao -e patch_win_instalar=true -e patch_win_permitir_reboot=true
+#
+# Controladores de domínio: sempre um por vez (serial 1 em produção) — nunca dois DCs juntos.
+# =============================================================================
+- name: Patch Windows Server guiado pelo Qualys (W2)
+  hosts: "{{ alvo | default('nao_producao') }}"
+  gather_facts: false
+  serial: "{{ lote | default(1) }}"
+  # Patch real: falhou um servidor, o lote para. Simulação (-e max_falhas=100): segue nos demais.
+  max_fail_percentage: "{{ max_falhas | default(0) }}"
+  vars:
+    plano_arquivo: "{{ playbook_dir }}/../out/plano.json"
+    plano: "{{ lookup('ansible.builtin.file', plano_arquivo) | from_json }}"
+
+  roles:
+    - patch_windows

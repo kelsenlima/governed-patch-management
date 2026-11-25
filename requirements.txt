@@ -1,0 +1,4 @@
+# Versões fixas: o agente cria um venv limpo a cada execução
+ansible-core==2.16.14
+PyYAML==6.0.2
+pywinrm==0.5.0

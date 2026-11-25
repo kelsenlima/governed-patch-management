@@ -1,0 +1,15 @@
+---
+# app-prd-01 — produção · aplicação (EXEMPLO, Debian 12)
+servicos_criticos:
+  - apache2
+  - mysql
+
+health_urls:
+  - http://127.0.0.1:80/
+
+# O Qualys acusa o PACOTE de kernel vulnerável instalado mesmo fora de uso:
+# remove só versões abaixo da exigida, nunca o kernel em uso, sem reboot.
+patch_remover_kernels_antigos: true
+
+# GRUB fixado num kernel antigo: a esteira passa para GRUB_DEFAULT=saved e testa o kernel novo em boot único.
+patch_corrigir_grub_fixado: true

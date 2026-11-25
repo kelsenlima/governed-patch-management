@@ -1,0 +1,981 @@
+---
+# =============================================================================
+# Role patch_linux — aplica no host o que o plano (out/plano.json) definiu.
+# Princípios:
+#   - só atualiza pacotes JÁ instalados (nunca instala pacote novo por engano);
+#   - pacotes-fonte do Qualys (ex.: "linux", "glibc") são convertidos para os
+#     pacotes binários instalados no host antes do apt;
+#   - reboot só se o sistema pedir E patch_permitir_reboot=true;
+#   - falha no pós-check NÃO faz downgrade automático: alerta e para o lote.
+#
+# Modo simulação (pipeline "🧪 Simular" = ansible-playbook --check --diff):
+#   - não instala, não remove e não reinicia nada;
+#   - os pré-checks rodam de verdade (são só leitura);
+#   - "apt-get -s" / "dnf list --upgrades" mostram versão atual → versão nova
+#     de cada pacote que SERIA atualizado.
+# =============================================================================
+
+- name: Plano deste host
+  ansible.builtin.set_fact:
+    _p: "{{ plano.hosts[inventory_hostname] | default({}) }}"
+
+- name: Sem itens no plano para este host
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: nada a fazer (sem detecções no plano)."
+  when: _p | length == 0
+
+- name: Executar patch
+  when: _p | length > 0
+  block:
+    - name: Montar listas desta execução
+      ansible.builtin.set_fact:
+        # "| bool" é obrigatório: valores vindos de -e chegam como texto ("False" é verdadeiro no Jinja)
+        _pkgs_comuns: >-
+          {{ (_p.pacotes.AUTO if (patch_aplicar_auto | bool) else [])
+             + (_p.pacotes.JANELA if (patch_aplicar_janela | bool) else []) }}
+        _pkgs_kernel: >-
+          {{ _p.pacotes.KERNEL
+             if ((patch_aplicar_kernel | bool) and not (_p.kernel_exige_janela | default(false)))
+                or (patch_aplicar_janela | bool)
+             else [] }}
+        _pkgs_remover: "{{ _p.pacotes.REMOVER if (patch_aplicar_remover | bool) else [] }}"
+        _avisos: []
+        _resultado:
+          host: "{{ inventory_hostname }}"
+          ambiente: "{{ _p.ambiente }}"
+          simulacao: "{{ ansible_check_mode }}"
+          inicio: "{{ now(utc=true).isoformat() }}"
+          kernel_antes: "{{ ansible_facts.kernel }}"
+          pacotes_atualizados: []
+          kernel_atualizado: false
+          removidos: []
+          mudancas_previstas: []
+          reboot: false
+          servicos_parados: []
+          servicos_falhos_antes: []
+          servicos_falhos_novos: []
+          avisos: []
+          status: "em_andamento"
+
+    - name: Resumo do que será feito
+      ansible.builtin.debug:
+        msg:
+          - "MODO: {{ 'SIMULAÇÃO (nada será alterado)' if ansible_check_mode else 'APLICAÇÃO REAL' }}"
+          - "Comuns/janela: {{ _pkgs_comuns | join(', ') or '-' }}"
+          - "Kernel: {{ _pkgs_kernel | join(', ') or '-' }}"
+          - "Remover: {{ _pkgs_remover | join(', ') or '-' }}"
+          - "Reboot permitido: {{ (patch_permitir_reboot | bool) and not ansible_check_mode }}"
+          - "Kernel atual: {{ ansible_facts.kernel }}"
+
+    # --------------------------------------------------------------- pré-check
+    - name: Pré-check — serviços críticos ativos
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      loop: "{{ servicos_criticos }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Pré-check — URLs de saúde
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        status_code: "{{ health_status_ok }}"
+        # health LOCAL: a 1ª resposta basta (301/302 para HTTPS = serviço no ar) e o certificado
+        # público não vale para 127.0.0.1 — por isso não segue redirecionamento nem valida certificado
+        follow_redirects: none
+        validate_certs: false
+        timeout: 15
+      loop: "{{ health_urls }}"
+      check_mode: false
+
+    - name: Pré-check — espaço livre em /boot (MB)
+      ansible.builtin.shell: |
+        set -o pipefail
+        df -Pm /boot | awk 'NR == 2 { print $4 }'
+      args:
+        executable: /bin/bash
+      register: _boot_livre
+      changed_when: false
+      check_mode: false
+      when: _pkgs_kernel | length > 0
+
+    - name: Pré-check — /boot precisa de pelo menos {{ patch_boot_min_mb }} MB para o kernel novo
+      ansible.builtin.assert:
+        that: (_boot_livre.stdout | int) >= (patch_boot_min_mb | int)
+        fail_msg: >-
+          /boot tem só {{ _boot_livre.stdout }} MB livres (mínimo {{ patch_boot_min_mb }} MB).
+          Limpe kernels antigos (apt autoremove --purge / dnf remove --oldinstallonly) antes do patch.
+        success_msg: "/boot com {{ _boot_livre.stdout }} MB livres"
+      when: _pkgs_kernel | length > 0
+
+    - name: Pré-check — kernels instalados e kernel padrão do boot (GRUB)
+      ansible.builtin.shell: |
+        set -o pipefail
+        NOVO=$(ls -1 /boot/vmlinuz-* 2>/dev/null | grep -v rescue | sed 's#^/boot/vmlinuz-##' | sort -V | tail -n 1)
+        if command -v grubby >/dev/null 2>&1; then
+          G="grubby: $(grubby --default-kernel 2>/dev/null)"
+          PADRAO=$(grubby --default-kernel 2>/dev/null | sed 's#^/boot/vmlinuz-##')
+        else
+          G=$(grep -E '^GRUB_DEFAULT=' /etc/default/grub 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"' || true)
+          if [ "$G" = "saved" ]; then
+            G="saved: $(grub-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')"
+          fi
+          PADRAO=$(echo "$G" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+[^ >"]*' | tail -n 1 || true)
+        fi
+        echo "novo=${NOVO}"
+        echo "padrao=${PADRAO}"
+        echo "grub=${G:-0}"
+      args:
+        executable: /bin/bash
+      register: _grub
+      changed_when: false
+      check_mode: false
+
+    - name: Kernel mais novo instalado x kernel fixado no GRUB
+      ansible.builtin.set_fact:
+        _kernel_mais_novo: "{{ (_grub.stdout_lines | select('match', '^novo=') | first | default('novo=')) | regex_replace('^novo=', '') }}"
+        _kernel_grub: "{{ (_grub.stdout_lines | select('match', '^padrao=') | first | default('padrao=')) | regex_replace('^padrao=', '') }}"
+        _grub_cfg: "{{ (_grub.stdout_lines | select('match', '^grub=') | first | default('grub=')) | regex_replace('^grub=', '') }}"
+
+    - name: Aviso — GRUB fixado em kernel mais antigo que o instalado
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + ['GRUB fixado no kernel ' ~ _kernel_grub ~ ' (mais novo instalado: ' ~ _kernel_mais_novo
+                         ~ '). O reboot NÃO carrega o kernel novo: ajustar GRUB_DEFAULT (ver README).'] }}
+      when:
+        - _kernel_grub | length > 0
+        - _kernel_mais_novo | length > 0
+        - _kernel_mais_novo not in _kernel_grub   # a entrada do GRUB pode ter sufixo -advanced-<uuid>
+        - "'grubby' not in _grub_cfg"
+
+    - name: Aviso — GRUB_DEFAULT fora do padrão (índice de submenu)
+      ansible.builtin.set_fact:
+        _avisos: "{{ _avisos + ['GRUB_DEFAULT=' ~ _grub_cfg ~ ' (fora do padrão 0/saved): conferir qual kernel o boot carrega.'] }}"
+      when:
+        - _kernel_grub | length == 0
+        - "_grub_cfg not in ['0', 'saved', '']"
+        - "not (_grub_cfg is match('^saved:'))"
+
+    - name: Aviso — GRUB fixado será corrigido pela esteira (patch_corrigir_grub_fixado)
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + ['patch_corrigir_grub_fixado ligado: ' ~ ('no patch real, com kernel novo e reboot permitido, ' if ansible_check_mode else 'com kernel novo e reboot permitido, ')
+                         ~ 'o GRUB passa para GRUB_DEFAULT=saved (backup em /etc/default/grub.bak-patch-*) e o kernel novo é testado '
+                         ~ 'em boot único; vira padrão só depois do pós-check.'] }}
+      when:
+        - patch_corrigir_grub_fixado | bool
+        - ansible_facts.pkg_mgr == 'apt'
+        - _avisos | select('search', '^GRUB fixado|^GRUB_DEFAULT=') | list | length > 0
+
+    - name: Pré-check — kernel e GRUB
+      ansible.builtin.debug:
+        msg:
+          - "Kernel em uso: {{ ansible_facts.kernel }}"
+          - "Kernel mais novo instalado: {{ _kernel_mais_novo or '-' }}"
+          - "GRUB: {{ _grub_cfg }}"
+          - "{{ 'ATENÇÃO: ' ~ (_avisos | last) if (_avisos | length > 0) else 'GRUB ok (inicia no kernel mais novo)' }}"
+
+    - name: Pré-check — serviços que JÁ estavam com falha antes do patch
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl list-units --type=service --state=failed --no-legend --plain | awk '{ print $1 }' | sort -u || true
+      args:
+        executable: /bin/bash
+      register: _falhos_antes
+      changed_when: false
+      check_mode: false
+
+    - name: Serviços já com falha (não causados pela esteira)
+      ansible.builtin.debug:
+        msg: "{{ _falhos_antes.stdout_lines or ['nenhum'] }}"
+
+    - name: Pré-check — serviços em execução antes do patch (foto para comparar depois)
+      ansible.builtin.shell: |
+        set -o pipefail
+        # Só conta serviço HABILITADO no boot (enabled). Serviços sob demanda
+        # (D-Bus/socket, ex.: upower, getty de console aberto) não voltam sozinhos e não são falha.
+        UNITS=$(systemctl list-units --type=service --state=running --no-legend --plain \
+                  | awk '{ print $1 }' \
+                  | grep -Ev '{{ patch_servicos_ignorar | join("|") }}' | sort -u || true)
+        [ -z "$UNITS" ] && exit 0
+        paste <(echo "$UNITS") <(systemctl is-enabled $UNITS 2>/dev/null || true) \
+          | awk -F'\t' '$2 == "enabled" { print $1 }'
+      args:
+        executable: /bin/bash
+      register: _svc_antes
+      changed_when: false
+      check_mode: false
+
+    # ---------------------------------------------------------- Debian / Ubuntu
+    - name: Debian/Ubuntu
+      when: ansible_facts.pkg_mgr == 'apt'
+      block:
+        - name: Outro apt/dpkg rodando no servidor? (só leitura)
+          ansible.builtin.shell: |
+            # processo de apt/dpkg de verdade (o "unattended-upgrade-shutdown --wait-for-signal" é um daemon
+            # que fica sempre rodando no Debian e NÃO segura o lock — não conta)
+            ocupados() {
+              pgrep -f '(^|/)(apt|apt-get|aptitude|dpkg|unattended-upgrade)( |$)' | while read -r p; do
+                a=$(ps -o args= -p "$p" 2>/dev/null) || continue
+                case "$a" in *unattended-upgrade-shutdown*|*pgrep*|*ESPEROU*) continue ;; esac
+                echo "$p"
+              done
+            }
+            for pid in $(ocupados); do ps -o pid=,etime=,args= -p "$pid"; done
+            exit 0
+          register: _apt_ocupado
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: Aviso — outro apt/dpkg rodando
+          ansible.builtin.set_fact:
+            _avisos: >-
+              {{ _avisos + ['Outro apt/dpkg estava rodando no servidor (' ~ (_apt_ocupado.stdout_lines | join('; ') | truncate(160))
+                 ~ '). A esteira espera até ' ~ patch_apt_lock_timeout ~ ' s pelo lock (patch_apt_lock_timeout).'] }}
+          when: _apt_ocupado.stdout_lines | default([]) | length > 0
+
+        - name: Atualizar índice do apt (não altera pacotes)
+          ansible.builtin.shell: |
+            set -o pipefail
+            apt-get update -q -o DPkg::Lock::Timeout={{ patch_apt_lock_timeout }} 2>&1 | tail -n 40
+          args:
+            executable: /bin/bash
+          register: _apt_update
+          changed_when: false
+          check_mode: false
+          failed_when: false
+
+        - name: Repositórios com erro no apt update
+          ansible.builtin.set_fact:
+            _repos_erro: >-
+              {{ (_apt_update.stdout_lines | select('search', '^(E:|W: ?GPG error|Err:|W: ?Failed to fetch)')
+                  | map('regex_search', 'https?://[^ ]+') | select | map('regex_replace', '^https?://([^/]+).*', '\1')
+                  | unique | list) }}
+
+        - name: Repositório OFICIAL com erro — parar (sem índice confiável não dá para aplicar patch)
+          ansible.builtin.fail:
+            msg: "apt update falhou em repositório oficial: {{ _repos_erro | select('search', patch_repos_oficiais) | list | join(', ') }}"
+          when: _repos_erro | select('search', patch_repos_oficiais) | list | length > 0
+
+        - name: Repositório de TERCEIROS com erro — seguir com aviso
+          ansible.builtin.debug:
+            msg: "AVISO: repositório(s) de terceiros com erro, ignorados nesta execução: {{ _repos_erro | join(', ') }}"
+          when: _repos_erro | length > 0
+
+        - name: Registrar aviso de repositório de terceiros
+          ansible.builtin.set_fact:
+            _avisos: "{{ _avisos + ['repositório de terceiros com erro no apt update: ' ~ (_repos_erro | join(', '))] }}"
+          when: _repos_erro | length > 0
+
+        - name: Converter nomes do Qualys (fonte ou binário) em pacotes instalados
+          ansible.builtin.shell: |
+            set -o pipefail
+            dpkg-query -W -f='${binary:Package}\t${source:Package}\t${Package}\n' \
+              | awk -F'\t' -v L="{{ _pkgs_comuns | join(' ') }}" '
+                  BEGIN { n = split(L, a, " "); for (i = 1; i <= n; i++) w[a[i]] = 1 }
+                  ($2 in w) || ($3 in w) { print $3 }' \
+              | sort -u
+          args:
+            executable: /bin/bash
+          register: _bin_comuns
+          changed_when: false
+          check_mode: false
+          when: _pkgs_comuns | length > 0
+
+        - name: Metapacotes de kernel instalados (o kernel novo chega por eles)
+          ansible.builtin.shell: |
+            set -o pipefail
+            # Só METAPACOTES (linux-image-gcp, linux-generic-hwe-22.04, linux-image-cloud-amd64...).
+            # Pacotes versionados (linux-modules-6.8.0-1066-gcp, linux-headers-5.15.0-187...) nunca recebem
+            # versão nova — pedir upgrade deles junto confunde o resolvedor do apt ("held broken packages").
+            dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\n' \
+              'linux-image-*' 'linux-headers-*' 'linux-modules-*' \
+              'linux-gcp*' 'linux-azure*' 'linux-aws*' 'linux-oracle*' 'linux-generic*' 'linux-virtual*' 'linux-cloud*' 2>/dev/null \
+              | awk -F'\t' '$1 ~ /^(ii|hi)/ { print $2 }' \
+              | grep -Ev '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' \
+              | grep -Ev -- '-(tools|cloud-tools)-' | sort -u || true
+          args:
+            executable: /bin/bash
+          register: _bin_kernel
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          when: _pkgs_kernel | length > 0
+
+        # "hi" = instalado + retido (apt-mark hold). Retido, o apt NUNCA atualiza e o erro aparece como
+        # "held broken packages". Caso comum: alguém rodou apt-mark hold 'linux-image-*' 'linux-headers-*'.
+        - name: Metapacotes de kernel retidos (apt-mark hold)
+          ansible.builtin.shell: |
+            apt-mark showhold 2>/dev/null | grep -Fx -f <(printf '%s\n' {{ _bin_kernel.stdout_lines | default([]) | map('quote') | join(' ') }}) || true
+          args:
+            executable: /bin/bash
+          register: _kernel_retidos
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          when: _pkgs_kernel | length > 0 and (_bin_kernel.stdout_lines | default([]) | length > 0)
+
+        - name: Liberar a retenção dos metapacotes de kernel (opt-in)
+          ansible.builtin.command:
+            argv: "{{ ['apt-mark', 'unhold'] + _kernel_retidos.stdout_lines }}"
+          register: _kernel_unhold
+          changed_when: true
+          when:
+            - _kernel_retidos.stdout_lines | default([]) | length > 0
+            - patch_liberar_hold_kernel | bool
+            - (patch_kernel_congelado | default('')) | length == 0
+
+        - name: Aviso — metapacotes de kernel retidos
+          ansible.builtin.set_fact:
+            _avisos: >-
+              {{ _avisos + ['Metapacotes de kernel RETIDOS (apt-mark hold): ' ~ (_kernel_retidos.stdout_lines | join(' '))
+                 ~ '. Retido, o kernel nunca é atualizado (apt responde "held broken packages"). '
+                 ~ (('Kernel CONGELADO de propósito (' ~ patch_kernel_congelado ~ '): a esteira não libera. '
+                     ~ 'Para fechar as vulns de kernel: validar a aplicação no kernel novo em homologação e liberar em janela, ou exceção.')
+                    if (patch_kernel_congelado | default('')) | length > 0 else
+                    ('Retenção liberada nesta execução (patch_liberar_hold_kernel).' if (_kernel_unhold.changed | default(false))
+                    else 'Confirmar se o hold foi proposital; liberar: apt-mark unhold ' ~ (_kernel_retidos.stdout_lines | join(' '))
+                         ~ ' (ou patch_liberar_hold_kernel: true no host_vars).'))] }}
+          when: _kernel_retidos.stdout_lines | default([]) | length > 0
+
+        # Kernel congelado de propósito: nem tentar os metapacotes de kernel (evita "held broken packages" repetido).
+        - name: Kernel congelado — tirar metapacotes de kernel desta execução
+          ansible.builtin.set_fact:
+            _bin_kernel: {stdout_lines: []}
+          when: (patch_kernel_congelado | default('')) | length > 0
+
+        - name: Versões que serão instaladas (apt-get -s, só leitura)
+          ansible.builtin.shell: |
+            RC=0
+            prever() {
+              apt-get -s -o Debug::NoLocking=1 install --only-upgrade "$@" 2>/tmp/.patch_apt_err || {
+                RC=100; echo "ERRO|$*|$(tr '\n' ' ' < /tmp/.patch_apt_err)"; return 0; }
+            }
+            {
+              COMUNS="{{ _bin_comuns.stdout_lines | default([]) | join(' ') }}"
+              [ -n "$COMUNS" ] && prever $COMUNS
+              # metapacotes de kernel um a um: um conflito (ex.: linux-generic x linux-generic-hwe) não bloqueia os outros
+              for m in {{ _bin_kernel.stdout_lines | default([]) | join(' ') }}; do prever "$m"; done
+            } | awk '/^ERRO\|/ { print; next }
+                /^Inst / {
+                  # "Inst pacote [versão atual] (versão nova ...)"; sem [..] = pacote novo (ex.: linux-image-X)
+                  if ($3 ~ /^\[/) { velha = substr($3, 2, length($3) - 2); nova = $4 }
+                  else             { velha = "(novo)"; nova = $3 }
+                  sub(/^\(/, "", nova)
+                  print $2 " " velha " -> " nova
+                }' | awk '!visto[$0]++'
+            rm -f /tmp/.patch_apt_err
+            exit $RC
+          args:
+            executable: /bin/bash
+          register: _apt_previsto
+          changed_when: false
+          check_mode: false
+          failed_when: false
+          when: >-
+            ((_bin_comuns.stdout_lines | default([])) + (_bin_kernel.stdout_lines | default([]))) | length > 0
+
+        - name: Aviso — apt não resolve as dependências desta atualização
+          ansible.builtin.set_fact:
+            _avisos: >-
+              {{ _avisos + (_apt_previsto.stdout_lines | select('match', '^ERRO[|]')
+                 | map('regex_replace', '^ERRO[|]([^|]*)[|](.*)$', 'apt não atualiza \1: \2')
+                 | map('truncate', 300)
+                 | map('regex_replace', '$', ' — conferir apt-mark showhold e apt-get -f install -s.') | list) }}
+          when: (_apt_previsto.stdout_lines | default([]) | select('match', '^ERRO[|]') | list | length) > 0
+
+        - name: Mudanças previstas neste host
+          ansible.builtin.debug:
+            msg: "{{ _apt_previsto.stdout_lines | default([]) | reject('match', '^ERRO[|]') | list or ['nenhum pacote a atualizar (já estão na versão nova?)'] }}"
+
+        - name: Kernel exigido pelo Qualys × kernel em uso × kernels antigos instalados
+          ansible.builtin.shell: |
+            set -o pipefail
+            EXIG='{{ _p.kernel_exigido }}'
+            EM_USO_PKG="linux-image-$(uname -r)"
+            EM_USO_VER=$(dpkg-query -W -f='${Version}' "$EM_USO_PKG" 2>/dev/null || true)
+            ATENDE=nao
+            if [ -n "$EM_USO_VER" ] && dpkg --compare-versions "$EM_USO_VER" ge "$EXIG"; then ATENDE=sim; fi
+            # variante (6.1.0-56-cloud-amd64 → cloud-amd64) e o metapacote dela
+            VAR=$(uname -r | sed -E 's/^[0-9.]+-[0-9]+-//')
+            META="linux-image-${VAR}"
+            INST=$(dpkg-query -W -f='${db:Status-Abbrev} ${Version}\n' "$META" 2>/dev/null | awk '$1 ~ /^(ii|hi)/ { print $2 }' || true)
+            CAND=$(apt-cache policy "$META" 2>/dev/null | awk '/Candidate:/ { print $2 }' || true)
+            # pacotes de kernel versionados (com ABI no nome) em versão ABAIXO da exigida — nunca o kernel em uso
+            ANTIGOS=$(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\t${Version}\n' \
+                        'linux-image-[0-9]*' 'linux-modules-[0-9]*' 'linux-modules-extra-[0-9]*' 'linux-headers-[0-9]*' 2>/dev/null \
+                      | awk -F'\t' '$1 ~ /^ii/ { print $2 "\t" $3 }' \
+                      | while IFS=$'\t' read -r pkg ver; do
+                          [ "$pkg" = "$EM_USO_PKG" ] && continue
+                          case "$pkg" in *"$(uname -r)"*) continue ;; esac
+                          if dpkg --compare-versions "$ver" lt "$EXIG"; then echo "$pkg"; fi
+                        done | sort -u | paste -sd' ' || true)
+            echo "em_uso=${EM_USO_PKG}"
+            echo "versao_em_uso=${EM_USO_VER:-?}"
+            echo "atende=${ATENDE}"
+            echo "variante=${VAR}"
+            echo "metapacote=${META}"
+            echo "instalado=${INST:-nao}"
+            echo "candidato=${CAND:-nenhum}"
+            echo "antigos=${ANTIGOS}"
+          args:
+            executable: /bin/bash
+          register: _kernel_repo
+          changed_when: false
+          check_mode: false
+          when: (_p.kernel_exigido | default('')) | length > 0
+
+        - name: Diagnóstico do kernel
+          ansible.builtin.set_fact:
+            _kmeta: "{{ dict(_kernel_repo.stdout_lines | select('search', '=') | map('split', '=', 1)) }}"
+          when: (_p.kernel_exigido | default('')) | length > 0
+
+        - name: Diagnóstico do kernel (resumo)
+          ansible.builtin.debug:
+            msg:
+              - "Qualys exige: {{ _p.kernel_exigido }} · em uso: {{ _kmeta.em_uso }} ({{ _kmeta.versao_em_uso }}) · atende: {{ _kmeta.atende }}"
+              - "Kernels ANTIGOS instalados (abaixo do exigido): {{ _kmeta.antigos or '-' }}"
+              - "Metapacote {{ _kmeta.metapacote }}: instalado {{ _kmeta.instalado }} · candidato {{ _kmeta.candidato }}"
+          when: (_p.kernel_exigido | default('')) | length > 0
+
+        # ---- caso 1: kernel em uso já atende; o Qualys acusa os kernels antigos ainda instalados
+        - name: Remover kernels antigos (abaixo do exigido; nunca o em uso) — opt-in
+          ansible.builtin.apt:
+            lock_timeout: "{{ patch_apt_lock_timeout }}"
+            name: "{{ _kmeta.antigos.split() }}"
+            state: absent
+            purge: true
+          register: _apt_kernels_antigos
+          when:
+            - (_p.kernel_exigido | default('')) | length > 0
+            - _kmeta.atende == 'sim'
+            - _kmeta.antigos | length > 0
+            - patch_remover_kernels_antigos | bool
+
+        - name: Aviso — kernel em uso já atende; falta remover kernels antigos
+          ansible.builtin.set_fact:
+            _avisos: >-
+              {{ _avisos + ['Kernel em uso (' ~ _kmeta.versao_em_uso ~ ') já atende ao Qualys (>= ' ~ _p.kernel_exigido
+                 ~ '). As vulnerabilidades vêm de kernels ANTIGOS ainda instalados: ' ~ _kmeta.antigos
+                 ~ '. Remover (sem reboot): patch_remover_kernels_antigos: true no host_vars, ou apt purge no servidor.'] }}
+          when:
+            - (_p.kernel_exigido | default('')) | length > 0
+            - _kmeta.atende == 'sim'
+            - _kmeta.antigos | length > 0
+            - not (_apt_kernels_antigos.changed | default(false))
+
+        # ---- caso 2: kernel em uso abaixo do exigido e o metapacote da variante não está instalado
+        - name: Instalar o metapacote da variante do kernel em uso (opt-in)
+          ansible.builtin.apt:
+            lock_timeout: "{{ patch_apt_lock_timeout }}"
+            name: "{{ _kmeta.metapacote }}"
+            state: present
+          register: _apt_meta
+          when:
+            - (_p.kernel_exigido | default('')) | length > 0
+            - _kmeta.atende == 'nao'
+            - _pkgs_kernel | length > 0
+            - _kmeta.instalado == 'nao'
+            - _kmeta.candidato != 'nenhum'
+            - patch_instalar_metapacote_kernel | bool
+
+        - name: Aviso — metapacote da variante do kernel não instalado
+          ansible.builtin.set_fact:
+            _avisos: >-
+              {{ _avisos + ['Kernel em uso é da variante "' ~ _kmeta.variante ~ '", mas o metapacote ' ~ _kmeta.metapacote
+                 ~ ' NÃO está instalado: o kernel desta variante nunca é atualizado (Qualys exige ' ~ _p.kernel_exigido
+                 ~ '; repositório oferece ' ~ _kmeta.candidato ~ '). Corrigir: apt install ' ~ _kmeta.metapacote
+                 ~ ' (ou patch_instalar_metapacote_kernel: true no host_vars).'] }}
+          when:
+            - (_p.kernel_exigido | default('')) | length > 0
+            - _kmeta.atende == 'nao'
+            - _kmeta.instalado == 'nao'
+            - _kmeta.candidato != 'nenhum'
+            - not (_apt_meta.changed | default(false))
+
+        # ---- caso 3: kernel em uso abaixo do exigido e o repositório não tem versão nova
+        - name: Aviso — repositório não oferece o kernel exigido
+          ansible.builtin.set_fact:
+            _avisos: >-
+              {{ _avisos + ['Qualys exige kernel ' ~ _p.kernel_exigido ~ '; em uso ' ~ _kmeta.versao_em_uso ~ ' e o metapacote '
+                 ~ _kmeta.metapacote ~ ' já está na versão do repositório (' ~ _kmeta.candidato ~ '). '
+                 ~ 'Conferir o repositório de segurança (bookworm-security / jammy-security / noble-security) ou espelho atrasado.'] }}
+          when:
+            - (_p.kernel_exigido | default('')) | length > 0
+            - _kmeta.atende == 'nao'
+            - _kmeta.instalado != 'nao'
+            - _kmeta.candidato in [_kmeta.instalado, 'nenhum']
+
+        # O lock_timeout do módulo apt não cobre o apt-get que ele chama: esperar aqui, explicitamente.
+        - name: Esperar outro apt/dpkg terminar (até patch_apt_lock_timeout)
+          ansible.builtin.shell: |
+            # processo de apt/dpkg de verdade (o "unattended-upgrade-shutdown --wait-for-signal" é um daemon
+            # que fica sempre rodando no Debian e NÃO segura o lock — não conta)
+            ocupados() {
+              pgrep -f '(^|/)(apt|apt-get|aptitude|dpkg|unattended-upgrade)( |$)' | while read -r p; do
+                a=$(ps -o args= -p "$p" 2>/dev/null) || continue
+                case "$a" in *unattended-upgrade-shutdown*|*pgrep*|*ESPEROU*) continue ;; esac
+                echo "$p"
+              done
+            }
+            LIMITE={{ patch_apt_lock_timeout | int }}; ESPEROU=0
+            while [ -n "$(ocupados)" ]; do
+              if [ "$ESPEROU" -ge "$LIMITE" ]; then
+                echo "apt/dpkg ocupado há mais de ${LIMITE}s por outro processo:"
+                for pid in $(ocupados); do
+                  ps -o pid=,etime=,user=,tty=,args= -p "$pid"
+                done
+                exit 1
+              fi
+              sleep 10; ESPEROU=$((ESPEROU + 10))
+            done
+            echo "livre (esperou ${ESPEROU}s)"
+          args:
+            executable: /bin/bash
+          register: _apt_espera
+          changed_when: false
+          failed_when: false
+          when: not ansible_check_mode
+
+        - name: Falha — apt/dpkg ocupado por outro processo
+          ansible.builtin.fail:
+            msg: >-
+              Outro apt/dpkg segura o lock do dpkg há mais de {{ patch_apt_lock_timeout }} s — nada foi instalado.
+              {{ _apt_espera.stdout_lines | join(' | ') }}.
+              Conferir no servidor (ps -fp <pid>): apt manual esquecido numa sessão SSH/screen ou unattended-upgrades travado.
+          when:
+            - not ansible_check_mode
+            - (_apt_espera.rc | default(0)) != 0
+
+        - name: Atualizar pacotes (somente os já instalados)
+          ansible.builtin.apt:
+            lock_timeout: "{{ patch_apt_lock_timeout }}"
+            name: "{{ _bin_comuns.stdout_lines }}"
+            state: latest
+            only_upgrade: true
+          register: _apt_comuns
+          when: _pkgs_comuns | length > 0 and (_bin_comuns.stdout_lines | default([]) | length > 0)
+
+        - name: Atualizar kernel (um metapacote por vez)
+          ansible.builtin.apt:
+            lock_timeout: "{{ patch_apt_lock_timeout }}"
+            name: "{{ item }}"
+            state: latest
+            only_upgrade: true
+          loop: "{{ _bin_kernel.stdout_lines | default([]) }}"
+          register: _apt_kernel
+          failed_when: false
+          when: _pkgs_kernel | length > 0 and (_bin_kernel.stdout_lines | default([]) | length > 0)
+
+        - name: Aviso — metapacote de kernel que o apt não conseguiu atualizar
+          ansible.builtin.set_fact:
+            _avisos: >-
+              {{ _avisos + (_apt_kernel.results | default([]) | selectattr('failed', 'defined') | selectattr('failed')
+                 | map(attribute='item') | map('regex_replace', '^(.*)$', 'apt não atualizou o metapacote \1 (conflito/retido) — os demais seguiram') | list) }}
+          when: _apt_kernel.results is defined
+
+        - name: Remover pacotes inseguros
+          ansible.builtin.apt:
+            lock_timeout: "{{ patch_apt_lock_timeout }}"
+            name: "{{ _pkgs_remover }}"
+            state: absent
+            purge: true
+          register: _apt_remover
+          when: _pkgs_remover | length > 0
+
+        - name: Sistema pede reboot?
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+          register: _reboot_flag
+
+        - name: Registrar resultado (apt)
+          ansible.builtin.set_fact:
+            _precisa_reboot: "{{ _reboot_flag.stat.exists }}"
+            _resultado: >-
+              {{ _resultado | combine({
+                   'pacotes_atualizados': (_bin_comuns.stdout_lines | default([])) if (_apt_comuns.changed | default(false)) else [],
+                   'kernel_atualizado': (_apt_kernel.results | default([]) | selectattr('changed') | list | length) > 0,
+                   'removidos': _pkgs_remover if (_apt_remover.changed | default(false)) else [],
+                   'mudancas_previstas': _apt_previsto.stdout_lines | default([]) | reject('match', '^ERRO[|]') | list,
+                   'kernels_antigos_removidos': (_kmeta.antigos.split() if (_apt_kernels_antigos.changed | default(false)) else []),
+                   'kernel_atende_qualys': (_kmeta.atende | default('')) if _kmeta is defined else '',
+                   'boot_livre_mb': (_boot_livre.stdout | default('')) | string
+                 }) }}
+
+    # ------------------------------------------------------------ RHEL / Rocky
+    - name: RHEL/Rocky
+      when: ansible_facts.pkg_mgr in ['dnf', 'yum', 'dnf5']
+      block:
+        - name: Versões que serão instaladas (dnf list --upgrades, somente leitura)
+          ansible.builtin.shell: |
+            set -o pipefail
+            dnf -q list --upgrades \
+              {{ (_pkgs_comuns + (['kernel*'] if (_pkgs_kernel | length > 0) else [])) | join(' ') }} 2>/dev/null \
+              | awk 'NF == 3 && $1 !~ /^(Available|Upgrades)/ { print $1 " -> " $2 }' || true
+          args:
+            executable: /bin/bash
+          register: _dnf_previsto
+          changed_when: false
+          check_mode: false
+          when: (_pkgs_comuns | length > 0) or (_pkgs_kernel | length > 0)
+
+        - name: Mudanças previstas neste host
+          ansible.builtin.debug:
+            msg: "{{ _dnf_previsto.stdout_lines | default([]) or ['nenhum pacote a atualizar (já estão na versão nova?)'] }}"
+
+        - name: Atualizar pacotes (somente os já instalados)
+          ansible.builtin.dnf:
+            lock_timeout: "{{ patch_apt_lock_timeout }}"
+            name: "{{ _pkgs_comuns }}"
+            state: latest
+            update_only: true
+          register: _dnf_comuns
+          when: _pkgs_comuns | length > 0
+
+        - name: Atualizar kernel
+          ansible.builtin.dnf:
+            lock_timeout: "{{ patch_apt_lock_timeout }}"
+            name: "kernel*"
+            state: latest
+            update_only: true
+          register: _dnf_kernel
+          when: _pkgs_kernel | length > 0
+
+        - name: Remover pacotes inseguros
+          ansible.builtin.dnf:
+            lock_timeout: "{{ patch_apt_lock_timeout }}"
+            name: "{{ _pkgs_remover }}"
+            state: absent
+          register: _dnf_remover
+          when: _pkgs_remover | length > 0
+
+        - name: Sistema pede reboot? (needs-restarting -r → rc 1)
+          ansible.builtin.command: needs-restarting -r
+          register: _nr
+          changed_when: false
+          check_mode: false
+          failed_when: _nr.rc not in [0, 1]
+
+        - name: Registrar resultado (dnf)
+          ansible.builtin.set_fact:
+            _precisa_reboot: "{{ _nr.rc == 1 }}"
+            _resultado: >-
+              {{ _resultado | combine({
+                   'pacotes_atualizados': _pkgs_comuns if (_dnf_comuns.changed | default(false)) else [],
+                   'kernel_atualizado': _dnf_kernel.changed | default(false),
+                   'removidos': _pkgs_remover if (_dnf_remover.changed | default(false)) else [],
+                   'mudancas_previstas': _dnf_previsto.stdout_lines | default([]),
+                   'boot_livre_mb': (_boot_livre.stdout | default('')) | string
+                 }) }}
+
+    # ------------------------------------------- kernel novo com volta automática
+    # Debian/Ubuntu: o kernel novo é testado em UM boot só (grub-reboot).
+    # O padrão do GRUB continua no kernel atual até o pós-check passar. Se o servidor
+    # não voltar ou a aplicação não responder, um reboot (console da nuvem) volta
+    # sozinho no kernel anterior. Só depois de tudo ok o kernel novo vira padrão.
+    - name: Kernel mais novo instalado (alvo do reboot)
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls -1 /boot/vmlinuz-* 2>/dev/null | grep -v rescue | sed 's#^/boot/vmlinuz-##' | sort -V | tail -n 1 || true
+      args:
+        executable: /bin/bash
+      register: _kernel_alvo
+      changed_when: false
+      check_mode: false
+
+    - name: Decidir se usa boot único no kernel novo
+      ansible.builtin.set_fact:
+        _usar_boot_unico: >-
+          {{ (patch_kernel_boot_unico | bool)
+             and not ansible_check_mode
+             and (patch_permitir_reboot | bool)
+             and ansible_facts.pkg_mgr == 'apt'
+             and (_pkgs_kernel | length > 0)
+             and (_kernel_alvo.stdout | length > 0)
+             and _kernel_alvo.stdout != ansible_facts.kernel
+             and ((patch_corrigir_grub_fixado | bool)
+                  or not (_avisos | select('search', '^GRUB fixado|^GRUB_DEFAULT=') | list | length > 0)) }}
+
+    - name: Boot único — localizar entradas do GRUB (kernel atual e kernel novo)
+      ansible.builtin.shell: |
+        set -o pipefail
+        command -v grub-reboot >/dev/null && command -v grub-set-default >/dev/null || { echo "sem-grub-reboot"; exit 0; }
+        CFG=/boot/grub/grub.cfg; [ -f "$CFG" ] || { echo "sem-grub-cfg"; exit 0; }
+        SUB=$(grep -oP "^submenu .*menuentry_id_option '\K[^']+" "$CFG" | head -n 1)
+        ent() { grep -oP "menuentry '[^']*Linux $1'.*menuentry_id_option '\K[^']+" "$CFG" | head -n 1; }
+        A=$(ent "{{ ansible_facts.kernel | regex_escape }}"); N=$(ent "{{ _kernel_alvo.stdout | regex_escape }}")
+        [ -n "$SUB" ] && [ -n "$A" ] && [ -n "$N" ] || { echo "entrada-nao-encontrada"; exit 0; }
+        echo "atual=${SUB}>${A}"
+        echo "nova=${SUB}>${N}"
+      args:
+        executable: /bin/bash
+      register: _grub_entradas
+      changed_when: false
+      when: _usar_boot_unico | bool
+
+    - name: Boot único — preparar GRUB (padrão = kernel atual, próximo boot = kernel novo)
+      when:
+        - _usar_boot_unico | bool
+        - _grub_entradas.stdout_lines | default([]) | select('match', '^nova=') | list | length > 0
+      block:
+        - name: Guardar entradas
+          ansible.builtin.set_fact:
+            _entrada_atual: "{{ _grub_entradas.stdout_lines | select('match', '^atual=') | first | regex_replace('^atual=', '') }}"
+            _entrada_nova: "{{ _grub_entradas.stdout_lines | select('match', '^nova=') | first | regex_replace('^nova=', '') }}"
+
+        - name: Backup de /etc/default/grub
+          ansible.builtin.copy:
+            src: /etc/default/grub
+            dest: "/etc/default/grub.bak-patch-{{ now(utc=true).strftime('%Y%m%d%H%M') }}"
+            remote_src: true
+            mode: preserve
+
+        - name: GRUB_DEFAULT=saved (permite boot único)
+          ansible.builtin.lineinfile:
+            path: /etc/default/grub
+            regexp: '^GRUB_DEFAULT='
+            line: 'GRUB_DEFAULT=saved'
+          register: _grub_saved
+
+        - name: Regerar grub.cfg
+          ansible.builtin.command: update-grub
+          when: _grub_saved.changed
+
+        - name: Padrão continua no kernel atual
+          ansible.builtin.command: grub-set-default "{{ _entrada_atual }}"
+
+        - name: Próximo boot (só um) no kernel novo
+          ansible.builtin.command: grub-reboot "{{ _entrada_nova }}"
+
+        - name: Boot único armado
+          ansible.builtin.set_fact:
+            _boot_unico_armado: true
+
+        - name: Boot único — informação
+          ansible.builtin.debug:
+            msg:
+              - "Próximo boot: {{ _kernel_alvo.stdout }} (uma vez só)"
+              - "Padrão (se reiniciar de novo): {{ ansible_facts.kernel }}"
+
+    - name: Boot único indisponível — seguir com reboot normal
+      ansible.builtin.set_fact:
+        _avisos: "{{ _avisos + ['Boot único do kernel novo indisponível (' ~ (_grub_entradas.stdout | default('?')) ~ '): reboot normal, sem volta automática.'] }}"
+      when:
+        - _usar_boot_unico | bool
+        - not (_boot_unico_armado | default(false))
+
+    # ------------------------------------------------------------------ reboot
+    - name: Reboot controlado
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ patch_reboot_timeout }}"
+        msg: "ansible-patch-qualys: reboot para aplicar kernel/bibliotecas"
+      when:
+        - not ansible_check_mode
+        - (_precisa_reboot | default(false) | bool) or (_boot_unico_armado | default(false))
+        - patch_permitir_reboot | bool
+      register: _reboot
+      tags: [reboot]
+
+    - name: Kernel em uso agora
+      ansible.builtin.command: uname -r
+      register: _uname
+      changed_when: false
+      check_mode: false
+
+    # -------------------------------------------------------------- pós-check
+    - name: Pós-check — serviços críticos ativos
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      loop: "{{ servicos_criticos }}"
+      changed_when: false
+      check_mode: false
+      register: _sc
+      retries: 5
+      delay: 15
+      until: _sc is succeeded
+
+    - name: Pós-check — URLs de saúde
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        status_code: "{{ health_status_ok }}"
+        # health LOCAL: a 1ª resposta basta (301/302 para HTTPS = serviço no ar) e o certificado
+        # público não vale para 127.0.0.1 — por isso não segue redirecionamento nem valida certificado
+        follow_redirects: none
+        validate_certs: false
+        timeout: 15
+      loop: "{{ health_urls }}"
+      check_mode: false
+      retries: 5
+      delay: 15
+      register: _hc
+      until: _hc is succeeded
+
+    - name: Pós-check — serviços que rodavam antes voltaram? (espera até ~2 min)
+      ansible.builtin.shell: |
+        set -o pipefail
+        # Só conta serviço HABILITADO no boot (enabled). Serviços sob demanda
+        # (D-Bus/socket, ex.: upower, getty de console aberto) não voltam sozinhos e não são falha.
+        UNITS=$(systemctl list-units --type=service --state=running --no-legend --plain \
+                  | awk '{ print $1 }' \
+                  | grep -Ev '{{ patch_servicos_ignorar | join("|") }}' | sort -u || true)
+        [ -z "$UNITS" ] && exit 0
+        paste <(echo "$UNITS") <(systemctl is-enabled $UNITS 2>/dev/null || true) \
+          | awk -F'\t' '$2 == "enabled" { print $1 }'
+      args:
+        executable: /bin/bash
+      register: _svc_depois
+      changed_when: false
+      check_mode: false
+      retries: 6
+      delay: 20
+      until: (_svc_antes.stdout_lines | difference(_svc_depois.stdout_lines)) | length == 0
+      ignore_errors: true
+
+    - name: Pós-check — kernel mais novo instalado agora
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls -1 /boot/vmlinuz-* 2>/dev/null | grep -v rescue | sed 's#^/boot/vmlinuz-##' | sort -V | tail -n 1 || true
+      args:
+        executable: /bin/bash
+      register: _kernel_novo_depois
+      changed_when: false
+      check_mode: false
+
+    - name: Aviso — kernel novo instalado mas não carregado
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + [
+               ('Reboot feito, mas o kernel em uso (' ~ _uname.stdout ~ ') não é o mais novo instalado ('
+                ~ _kernel_novo_depois.stdout ~ '): GRUB fixado? As vulnerabilidades de kernel continuam abertas.')
+               if (_reboot.rebooted | default(false)) else
+               ('Kernel ' ~ _kernel_novo_depois.stdout ~ ' já instalado; em uso ' ~ _uname.stdout
+                ~ ': falta reboot para fechar as vulnerabilidades de kernel.')
+             ] }}
+      when:
+        - _kernel_novo_depois.stdout | length > 0
+        - _uname.stdout != _kernel_novo_depois.stdout
+
+    - name: Pós-check — serviços com falha depois do patch
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl list-units --type=service --state=failed --no-legend --plain | awk '{ print $1 }' | sort -u || true
+      args:
+        executable: /bin/bash
+      register: _falhos_depois
+      changed_when: false
+      check_mode: false
+
+    - name: Aviso — serviços que passaram a falhar depois do patch
+      ansible.builtin.set_fact:
+        _avisos: >-
+          {{ _avisos + ['Serviços que passaram a falhar depois do patch: '
+                        ~ (_falhos_depois.stdout_lines | difference(_falhos_antes.stdout_lines) | join(', '))] }}
+      when: (_falhos_depois.stdout_lines | difference(_falhos_antes.stdout_lines)) | length > 0
+
+    - name: Registrar serviços que não voltaram
+      ansible.builtin.set_fact:
+        _svc_parados: "{{ _svc_antes.stdout_lines | difference(_svc_depois.stdout_lines | default([])) }}"
+
+    - name: Pós-check — falhar se algum serviço não voltou
+      ansible.builtin.fail:
+        msg: >-
+          Serviços que rodavam antes e não voltaram: {{ _svc_parados | join(', ') }}.
+          Verifique com systemctl status / journalctl -b. Nenhum rollback automático foi feito.
+      when: _svc_parados | length > 0
+
+    - name: Boot único — servidor voltou no kernel ANTIGO (kernel novo não subiu?)
+      ansible.builtin.fail:
+        msg: >-
+          O servidor voltou no kernel {{ _uname.stdout }} e não no {{ _kernel_alvo.stdout }}.
+          O padrão do GRUB continua no kernel anterior. Ver console/logs de boot antes de tentar de novo.
+      when:
+        - _boot_unico_armado | default(false)
+        - _reboot.rebooted | default(false)
+        - _uname.stdout != _kernel_alvo.stdout
+
+    - name: Boot único — kernel novo validado, tornar padrão
+      ansible.builtin.command: grub-set-default "{{ _entrada_nova }}"
+      when:
+        - _boot_unico_armado | default(false)
+        - _reboot.rebooted | default(false)
+        - _uname.stdout == _kernel_alvo.stdout
+
+    - name: Resultado final
+      ansible.builtin.set_fact:
+        _resultado: >-
+          {{ _resultado | combine({
+               'reboot': _reboot.rebooted | default(false),
+               'reboot_pendente': (_precisa_reboot | default(false) | bool) and not (_reboot.rebooted | default(false)),
+               'kernel_depois': _uname.stdout,
+               'kernel_mais_novo_instalado': _kernel_novo_depois.stdout | default(''),
+               'grub': _grub_cfg | default(''),
+               'servicos_parados': _svc_parados,
+               'kernel_boot_unico': _boot_unico_armado | default(false),
+               'servicos_falhos_antes': _falhos_antes.stdout_lines | default([]),
+               'servicos_falhos_novos': (_falhos_depois.stdout_lines | default([])) | difference(_falhos_antes.stdout_lines | default([])),
+               'avisos': _avisos | default([]),
+               'fim': now(utc=true).isoformat(),
+               'status': 'simulado' if ansible_check_mode else 'ok'
+             }) }}
+
+  rescue:
+    - name: Falha — registrar (sem downgrade automático)
+      ansible.builtin.set_fact:
+        _resultado: >-
+          {{ (_resultado | default({'host': inventory_hostname})) | combine({
+               'status': 'falha',
+               'servicos_parados': _svc_parados | default([]),
+               'reboot': _reboot.rebooted | default(false),
+               'kernel_depois': _uname.stdout | default(''),
+               'kernel_mais_novo_instalado': _kernel_novo_depois.stdout | default(_kernel_mais_novo | default('')),
+               'grub': _grub_cfg | default(''),
+               'servicos_falhos_antes': _falhos_antes.stdout_lines | default([]),
+               'servicos_falhos_novos': (_falhos_depois.stdout_lines | default([])) | difference(_falhos_antes.stdout_lines | default([])),
+               'avisos': _avisos | default([]),
+               'erro': (ansible_failed_result.msg | default('erro desconhecido')) | truncate(400),
+               'fim': now(utc=true).isoformat()
+             }) }}
+
+    - name: Instrução de volta do kernel (boot único armado)
+      ansible.builtin.set_fact:
+        _resultado: >-
+          {{ _resultado | combine({
+               'kernel_boot_unico': true,
+               'como_voltar': 'O padrão do GRUB continua no kernel ' ~ ansible_facts.kernel
+                              ~ '. Se o servidor não respondeu: reiniciar pelo console da nuvem (volta sozinho no kernel anterior). '
+                              ~ 'Se respondeu mas a aplicação falhou: "reboot" no servidor volta no kernel anterior.'
+             }) }}
+      when: _boot_unico_armado | default(false)
+
+    - name: Interromper o lote neste host
+      ansible.builtin.fail:
+        msg: >-
+          Patch falhou em {{ inventory_hostname }}: {{ _resultado.erro }}.
+          {{ _resultado.como_voltar | default('Nenhum rollback automático foi feito.') }}
+      # Simulação: a falha fica no resultado (status "falha") e os demais servidores seguem.
+      # Patch real: o host falha e o lote para.
+      when: not ansible_check_mode
+
+    - name: Simulação — falha registrada, seguindo para os próximos servidores
+      ansible.builtin.debug:
+        msg: "SIMULAÇÃO: {{ inventory_hostname }} teria falhado ({{ _resultado.erro }}). Registrado no resultado."
+      when: ansible_check_mode
+
+  always:
+    - name: Pasta de resultados no agente
+      ansible.builtin.file:
+        path: "{{ patch_dir_resultado }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+      check_mode: false
+      when: _p | length > 0
+
+    - name: Gravar resultado no agente
+      ansible.builtin.copy:
+        content: "{{ _resultado | default({'host': inventory_hostname, 'status': 'sem_itens'}) | to_nice_json }}"
+        dest: "{{ patch_dir_resultado }}/{{ inventory_hostname }}.json"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      check_mode: false
+      when: _p | length > 0

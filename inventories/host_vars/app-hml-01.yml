@@ -1,0 +1,6 @@
+---
+servicos_criticos:
+  - nginx
+  - mysql
+health_urls:
+  - http://127.0.0.1:80/

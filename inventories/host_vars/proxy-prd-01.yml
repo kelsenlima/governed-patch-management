@@ -1,0 +1,4 @@
+---
+# proxy-prd-01 — produção · proxy (EXEMPLO, Rocky Linux 8)
+servicos_criticos:
+  - httpd

@@ -1,0 +1,12 @@
+---
+# web-prd-02 — produção · web (EXEMPLO)
+servicos_criticos:
+  - nginx
+  - php8.2-fpm
+
+health_urls:
+  - http://127.0.0.1:80/
+
+# Kernel retido com apt-mark hold DE PROPÓSITO (compatibilidade da aplicação):
+# a esteira nunca libera o hold e o aviso deixa claro que é decisão, não falha.
+patch_kernel_congelado: "hold proposital por compatibilidade da aplicação"

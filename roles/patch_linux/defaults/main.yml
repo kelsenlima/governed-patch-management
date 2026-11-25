@@ -1,0 +1,85 @@
+---
+# Rotas do plano que esta execução aplica (as demais ficam para depois)
+patch_aplicar_auto: true
+patch_aplicar_kernel: false     # a pipeline liga em não-produção
+patch_aplicar_janela: false     # só em janela de manutenção aprovada
+patch_aplicar_remover: false    # remoção de pacotes: sempre decisão explícita
+
+# Reboot: só acontece se o sistema pedir E esta flag estiver ligada
+# (em modo simulação --check nunca reinicia)
+patch_permitir_reboot: false
+patch_reboot_timeout: 900
+
+# Kernel novo com volta automática (Debian/Ubuntu): testa o kernel novo em UM boot
+# (grub-reboot); só vira padrão depois que o servidor volta e o pós-check passa.
+# Não mexe no GRUB se ele estiver fixado num kernel (aviso "GRUB fixado"), a não ser com
+# patch_corrigir_grub_fixado (abaixo).
+patch_kernel_boot_unico: true
+
+# GRUB fixado num kernel antigo (GRUB_DEFAULT="Advanced options...>...Linux X" ou índice de submenu):
+# o reboot nunca carrega o kernel novo. Ligado (por servidor, no host_vars), a esteira usa o mesmo
+# boot único: backup de /etc/default/grub, GRUB_DEFAULT=saved, padrão = kernel em uso e próximo boot
+# (um só) = kernel novo; depois do pós-check ok o kernel novo vira padrão. Se der errado, um reboot
+# volta para o kernel em uso. Só age quando há kernel novo para testar e o reboot é permitido. Opt-in.
+patch_corrigir_grub_fixado: false
+
+# Debian/Ubuntu: instalar o metapacote da variante do kernel EM USO quando ele não estiver
+# instalado (ex.: linux-image-cloud-amd64). Sem ele o kernel daquela variante nunca é
+# atualizado. É a ÚNICA exceção ao "só atualiza o que já está instalado" — por isso opt-in.
+patch_instalar_metapacote_kernel: false
+
+# Debian/Ubuntu: remover pacotes de kernel ANTIGOS (versão abaixo da exigida pelo Qualys)
+# quando o kernel EM USO já atende. O Qualys acusa o pacote vulnerável instalado mesmo sem
+# estar em uso. Nunca remove o kernel em uso; não precisa de reboot. Opt-in.
+patch_remover_kernels_antigos: false
+
+# Debian/Ubuntu: liberar (apt-mark unhold) os metapacotes de kernel INSTALADOS que estiverem retidos.
+# Retido, o kernel nunca atualiza ("held broken packages"). Só os metapacotes — os demais holds ficam. Opt-in.
+patch_liberar_hold_kernel: false
+
+# Kernel congelado DE PROPÓSITO (ex.: compatibilidade da aplicação): texto com o motivo, no host_vars.
+# Com ele preenchido a esteira nunca libera o hold e o aviso deixa claro que é decisão, não falha.
+patch_kernel_congelado: ""
+
+# Quanto tempo (segundos) esperar se outro apt/dpkg/dnf estiver rodando no servidor
+# (ex.: unattended-upgrades, apt manual). Padrão do Ansible é 60 s — pouco para o
+# unattended-upgrades terminar. Visto em produção: unattended-upgrades segurando o lock por vários minutos.
+patch_apt_lock_timeout: 900
+
+# Pré-check de kernel: espaço mínimo livre em /boot (MB)
+patch_boot_min_mb: 150
+
+# Comparação de serviços antes/depois: unidades transitórias que não contam
+# (expressões regulares, grep -E)
+patch_servicos_ignorar:
+  - '^user@'
+  - '^session-'
+  - '^apt-'
+  - '^unattended-upgrades'
+  - '^packagekit'
+  - '^fwupd'
+  - '^man-db'
+  - '^dpkg-db-backup'
+  - '^systemd-tmpfiles'
+  - '^dnf-makecache'
+  - '^logrotate'
+  - '^getty@'
+  - '^upower'
+  - '^udisks2'
+  - '^polkit'
+
+# apt update: erro nestes repositórios (regex no host) PARA o patch;
+# erro em qualquer outro (InfluxData, Docker, Zabbix...) vira só aviso no resultado
+patch_repos_oficiais: '(archive|security|ports)\.ubuntu\.com|\.archive\.ubuntu\.com|deb\.debian\.org|security\.debian\.org|mirrors?\.|huaweicloud\.com|azure\.archive|gce|googleapis|cloud\.debian'
+
+# Validações da APLICAÇÃO antes/depois — definir por servidor em
+# inventories/host_vars/<servidor>.yml (sugestão: modo "🔍 Descobrir serviços" da pipeline)
+#   servicos_criticos: [nginx, php8.3-fpm]
+#   health_urls: [http://127.0.0.1/]
+servicos_criticos: []
+health_urls: []
+# Códigos HTTP que contam como "aplicação respondendo" (401/403 = no ar, pedindo login)
+health_status_ok: [200, 204, 301, 302, 401, 403]
+
+# Onde gravar o resultado por host (no agente)
+patch_dir_resultado: "{{ playbook_dir }}/../out/resultado"

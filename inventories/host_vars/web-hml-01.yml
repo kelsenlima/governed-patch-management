@@ -1,0 +1,5 @@
+---
+servicos_criticos:
+  - nginx
+health_urls:
+  - http://127.0.0.1:80/

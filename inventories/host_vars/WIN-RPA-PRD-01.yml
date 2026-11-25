@@ -1,0 +1,4 @@
+---
+# WIN-RPA-PRD-01 — robôs (RPA) com Office ClickToRun (EXEMPLO).
+# Atenção: o W2b do Office fecha Word/Excel/Outlook abertos — rodar fora do horário dos robôs.
+servicos_criticos: []

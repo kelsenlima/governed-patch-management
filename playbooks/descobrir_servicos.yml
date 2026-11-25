@@ -1,0 +1,178 @@
+---
+# =============================================================================
+# Descobrir serviços e URLs de saúde (SOMENTE LEITURA)
+#
+# Para cada servidor: lista os serviços de APLICAÇÃO habilitados e rodando
+# (ignora serviços do sistema, agentes de nuvem e monitoração) e testa as portas
+# TCP abertas por eles em 127.0.0.1 (http e https). Gera, no agente:
+#   out/descoberta/<servidor>.yml   → sugestão de inventories/host_vars/<servidor>.yml
+#   out/descoberta.md               → resumo para revisar (aba Summary da run)
+#
+# Nada é alterado no servidor. A sugestão só passa a valer depois de revisada e
+# copiada para inventories/host_vars/ no repositório.
+#
+#   ansible-playbook playbooks/descobrir_servicos.yml -e alvo=nao_producao --limit web-hml-01
+# =============================================================================
+- name: Descobrir serviços de aplicação e URLs de saúde
+  hosts: "{{ alvo | default('nao_producao') }}"
+  become: true
+  gather_facts: false
+  vars:
+    dir_saida: "{{ playbook_dir }}/../out/descoberta"
+    # serviços que NÃO são aplicação (sistema, nuvem, monitoração e agentes de segurança:
+    # aella_* = Stellar Cyber/SOC; ds_agent, tmxbc, vls_agent = Trend Micro)
+    ignorar_regex: >-
+      ^(ssh|sshd|cron|crond|rsyslog|systemd-|dbus|snapd|polkit|udisks2|upower|getty@|serial-getty@|
+      multipathd|irqbalance|chrony|chronyd|ntp|ntpd|qualys-cloud-agent|unattended-upgrades|ModemManager|
+      networkd-dispatcher|NetworkManager|wpa_supplicant|accounts-daemon|atd|auditd|firewalld|tuned|
+      google-|gce-|waagent|walinuxagent|hostguard|uniagent|telescope|cloudResetPwd|hss|ces-|
+      zabbix-agent|telegraf|node_exporter|fail2ban|containerd|lvm2|open-vm-tools|vmtoolsd|
+      qemu-guest-agent|amazon-|apport|blk-availability|kdump|mdmonitor|iscsid|rpcbind|unbound|
+      packagekit|fwupd|ufw|apparmor|cloud-|rngd|smartd|lxd|lxcfs|thermald|sysstat|postfix|exim4|
+      user@|session-|polkitd|gssproxy|libstoragemgmt|mcelog|plymouth|wazuh-agent|falcon-sensor|
+      osqueryd|ossec|td-agent|fluent-bit|filebeat|metricbeat|datadog-agent|ssm-agent|snap\.|
+      aella_|ds_agent|tmxbc|vls_agent|agentid|ds_filter|ds_notifier|cylance|sentinel|cbagent|
+      sysmon|commvault|veeam|clamav|lfd$|haveged|google-cloud-ops|otelopscol|fluent|hv-kvp|hv-vss|hv-fcopy)
+    # 10001 = agentid-service (Trend Micro)
+    # 5066 = endpoint de monitoração de agente de log; 20201/20202 = Google Ops Agent (otelopscol/fluent-bit)
+    ignorar_portas: [22, 25, 53, 111, 323, 631, 5066, 10001, 10050, 10051, 20201, 20202]
+    health_status_ok: [200, 204, 301, 302, 401, 403]
+
+  tasks:
+    - name: Serviços de aplicação habilitados e rodando
+      ansible.builtin.shell: |
+        set -o pipefail
+        UNITS=$(systemctl list-units --type=service --state=running --no-legend --plain \
+                  | awk '{ print $1 }' | sed 's/\.service$//' \
+                  | grep -Ev '{{ ignorar_regex | replace("\n", "") | replace(" ", "") }}' | sort -u || true)
+        [ -z "$UNITS" ] && exit 0
+        for u in $UNITS; do
+          if [ "$(systemctl is-enabled "$u" 2>/dev/null)" = "enabled" ]; then echo "$u"; fi
+        done
+        exit 0
+      args:
+        executable: /bin/bash
+      register: _svc
+      changed_when: false
+      check_mode: false
+
+    - name: Portas TCP abertas e processo dono
+      ansible.builtin.shell: |
+        set -o pipefail
+        command -v ss >/dev/null || { echo "sem comando ss (pacote iproute2)" >&2; exit 0; }
+        ss -ltnpH 2>/dev/null | awk '{
+            addr = $4; n = split(addr, p, ":"); porta = p[n]
+            proc = $6; sub(/^users:\(\("/, "", proc); sub(/".*/, "", proc)
+            print porta "\t" proc
+          }' | sort -u -t$'\t' -k1,1n
+      args:
+        executable: /bin/bash
+      register: _portas
+      changed_when: false
+      check_mode: false
+
+    - name: Testar http/https em 127.0.0.1 nas portas dos serviços
+      ansible.builtin.shell: |
+        command -v curl >/dev/null || { echo "sem-curl"; exit 0; }
+        while IFS=$'\t' read -r porta proc; do
+          [ -z "$porta" ] && continue
+          case " {{ ignorar_portas | join(' ') }} " in *" $porta "*) continue ;; esac
+          for esquema in http https; do
+            url="${esquema}://127.0.0.1:${porta}/"
+            cod=$(curl -sk -o /dev/null -m 4 -w '%{http_code}' "$url" 2>/dev/null || true)
+            if [ -n "$cod" ] && [ "$cod" != "000" ]; then
+              printf '%s|%s|%s\n' "$url" "$cod" "$proc"
+              break
+            fi
+          done
+        done <<'EOF'
+        {{ _portas.stdout }}
+        EOF
+        exit 0
+      args:
+        executable: /bin/bash
+      register: _urls
+      changed_when: false
+      check_mode: false
+
+    - name: Montar sugestão
+      ansible.builtin.set_fact:
+        _criticos: "{{ _svc.stdout_lines }}"
+        _urls_ok: >-
+          {{ _urls.stdout_lines | select('match', '^https?://[^|]+[|][0-9]{3}[|]') | map('split', '|')
+             | selectattr('1', 'in', health_status_ok | map('string') | list)
+             | map('first') | list }}
+        _urls_outras: >-
+          {{ _urls.stdout_lines | select('match', '^https?://[^|]+[|][0-9]{3}[|]') | map('split', '|')
+             | rejectattr('1', 'in', health_status_ok | map('string') | list) | list }}
+
+    - name: Pasta de saída no agente
+      ansible.builtin.file:
+        path: "{{ dir_saida }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Gravar sugestão de host_vars
+      ansible.builtin.copy:
+        dest: "{{ dir_saida }}/{{ inventory_hostname }}.yml"
+        mode: "0644"
+        content: |
+          ---
+          # Sugestão gerada por playbooks/descobrir_servicos.yml em {{ now(utc=true).strftime('%Y-%m-%d %H:%M') }} UTC.
+          # REVISAR com o responsável da aplicação antes de copiar para inventories/host_vars/{{ inventory_hostname }}.yml
+          #
+          # Serviços de aplicação habilitados e rodando (a esteira exige que estejam ativos antes E depois do patch)
+          servicos_criticos:
+          {% for s in _criticos %}
+            - {{ s }}
+          {% else %}
+            []
+          {% endfor %}
+
+          # URLs que responderam com {{ health_status_ok | join('/') }} em 127.0.0.1
+          health_urls:
+          {% for u in _urls_ok %}
+            - {{ u }}
+          {% else %}
+            []
+          {% endfor %}
+          {% if _urls_outras %}
+
+          # Responderam com outro código (avaliar se servem como health check; trocar o caminho, ex.: /health):
+          {% for u in _urls_outras %}
+          #   - {{ u[0] }}   → HTTP {{ u[1] }} ({{ u[2] }})
+          {% endfor %}
+          {% endif %}
+      delegate_to: localhost
+      become: false
+
+    - name: Sugestão deste servidor (também no artefato "descoberta")
+      ansible.builtin.debug:
+        msg:
+          - "servicos_criticos: {{ _criticos }}"
+          - "health_urls: {{ _urls_ok }}"
+          - "outras portas HTTP: {% for u in _urls_outras %}{{ u[0] }} (HTTP {{ u[1] }}, {{ u[2] }}) {% else %}-{% endfor %}"
+
+    # roda uma vez, no agente, dentro da mesma play (o --limit não exclui)
+    - name: Montar descoberta.md
+      ansible.builtin.copy:
+        dest: "{{ dir_saida }}/../descoberta.md"
+        mode: "0644"
+        content: |
+          # Descoberta de serviços e URLs de saúde (somente leitura)
+
+          Revisar com o responsável de cada aplicação e copiar o arquivo do artefato **descoberta**
+          para `inventories/host_vars/<servidor>.yml`. A partir daí a esteira exige que esses serviços
+          e URLs estejam no ar **antes e depois** do patch.
+
+          | Servidor | Serviços de aplicação | URLs de saúde sugeridas | Outras portas HTTP |
+          |---|---|---|---|
+          {% for h in ansible_play_hosts_all | sort if hostvars[h]._criticos is defined %}
+          | {{ h }} | {{ hostvars[h]._criticos | join(', ') or '—' }} | {{ hostvars[h]._urls_ok | join('<br>') or '—' }} | {% for u in hostvars[h]._urls_outras %}{{ u[0] }} ({{ u[1] }}, {{ u[2] }})<br>{% else %}—{% endfor %} |
+          {% endfor %}
+      delegate_to: localhost
+      become: false
+      run_once: true

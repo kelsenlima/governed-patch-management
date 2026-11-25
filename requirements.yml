@@ -1,0 +1,5 @@
+---
+# Coleções Ansible (versão fixa) — instaladas pela pipeline quando o job usa Windows
+collections:
+  - name: ansible.windows
+    version: 2.5.0
